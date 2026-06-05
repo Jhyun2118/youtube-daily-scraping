@@ -4,12 +4,12 @@ on:
   schedule:
     # 01:00 UTC = 10:00 KST (매일)
     - cron: '0 1 * * *'
-  workflow_dispatch:  # 수동 트리거 가능
+  workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    timeout-minutes: 350  # 5h50m (GitHub 6h 한도 안쪽)
+    timeout-minutes: 350
 
     env:
       DB_DIR: /home/runner/youtube_daily_db
@@ -34,49 +34,91 @@ jobs:
         run: |
           pip install -r scraper/requirements.txt
 
-      - name: Setup B2 CLI
+      - name: Debug environment
         run: |
-          pip install b2
-          b2 account authorize "$B2_KEY_ID" "$B2_APPLICATION_KEY"
+          echo "Python: $(python3 --version)"
+          echo "b2sdk version:"
+          python3 -c "import b2sdk; print(b2sdk.__version__)"
+          echo "Secrets check (lengths, not values):"
+          echo "  B2_KEY_ID length: ${#B2_KEY_ID}"
+          echo "  B2_APPLICATION_KEY length: ${#B2_APPLICATION_KEY}"
+          echo "  B2_BUCKET: '$B2_BUCKET'"
+          echo "  YOUTUBE_API_KEY length: ${#YOUTUBE_API_KEY}"
 
       - name: Download DB from B2
         run: |
           mkdir -p "$DB_DIR"
-          if b2 file download "b2://$B2_BUCKET/$DB_FILE" "$DB_DIR/$DB_FILE"; then
-            echo "DB downloaded: $(ls -lh $DB_DIR/$DB_FILE)"
-          else
-            echo "::warning::No existing DB on B2. Will create new from seed."
-            # 초기 시드가 없으면 워크플로우 실패. 첫 실행 전에 수동 업로드 필요.
-            exit 1
-          fi
+          python3 - <<'EOF'
+          import os, sys
+          from b2sdk.v2 import InMemoryAccountInfo, B2Api
+
+          info = InMemoryAccountInfo()
+          api = B2Api(info)
+          api.authorize_account("production", os.environ["B2_KEY_ID"], os.environ["B2_APPLICATION_KEY"])
+          print(f"Authorized. Account ID: {info.get_account_id()}")
+
+          bucket_name = os.environ["B2_BUCKET"]
+          db_file = os.environ["DB_FILE"]
+          db_dir = os.environ["DB_DIR"]
+          local_path = os.path.join(db_dir, db_file)
+
+          bucket = api.get_bucket_by_name(bucket_name)
+          print(f"Got bucket: {bucket_name}")
+
+          # Check if file exists
+          found = None
+          for file_info, _ in bucket.ls():
+              if file_info.file_name == db_file:
+                  found = file_info
+                  break
+          if not found:
+              print(f"::error::File '{db_file}' not found in bucket '{bucket_name}'")
+              print(f"Available files: {[fi.file_name for fi, _ in bucket.ls()][:10]}")
+              sys.exit(1)
+          print(f"Found file: {db_file} ({found.size/1024/1024:.1f} MB)")
+
+          dl = bucket.download_file_by_name(db_file)
+          dl.save_to(local_path)
+          size = os.path.getsize(local_path)
+          print(f"Downloaded to {local_path} ({size/1024/1024:.1f} MB)")
+          EOF
 
       - name: Run daily scrape
         run: |
           cd scraper
           python3 scrape_daily.py
-        continue-on-error: true  # 부분 실패해도 DB 업로드는 시도
+        continue-on-error: true
 
       - name: Upload DB to B2
         if: always()
         run: |
-          b2 file upload "$B2_BUCKET" "$DB_DIR/$DB_FILE" "$DB_FILE"
-          echo "DB uploaded: $(ls -lh $DB_DIR/$DB_FILE)"
+          python3 - <<'EOF'
+          import os, sys
+          from b2sdk.v2 import InMemoryAccountInfo, B2Api
 
-      - name: Weekly snapshot (Sundays only)
-        if: success() && github.event.schedule == '0 1 * * *' && contains(fromJson('["0"]'), format('{0}', github.run_id))
-        run: |
-          # 일요일에만 스냅샷 저장 (롤백 대비)
-          DOW=$(date -u +%u)  # 1=Mon, 7=Sun
-          if [ "$DOW" = "7" ]; then
-            DATE=$(date -u +%Y-%m-%d)
-            b2 file upload "$B2_BUCKET" "$DB_DIR/$DB_FILE" "snapshots/youtube_daily_${DATE}.db"
-            echo "Weekly snapshot saved: snapshots/youtube_daily_${DATE}.db"
-          fi
+          info = InMemoryAccountInfo()
+          api = B2Api(info)
+          api.authorize_account("production", os.environ["B2_KEY_ID"], os.environ["B2_APPLICATION_KEY"])
+          bucket = api.get_bucket_by_name(os.environ["B2_BUCKET"])
+
+          local_path = os.path.join(os.environ["DB_DIR"], os.environ["DB_FILE"])
+          if not os.path.exists(local_path):
+              print(f"::error::No local DB at {local_path}")
+              sys.exit(1)
+          size = os.path.getsize(local_path)
+          print(f"Uploading {local_path} ({size/1024/1024:.1f} MB)...")
+
+          bucket.upload_local_file(
+              local_file=local_path,
+              file_name=os.environ["DB_FILE"],
+          )
+          print(f"Uploaded.")
+          EOF
 
       - name: Show scrape log
         if: always()
         run: |
-          tail -50 scraper/logs/scrape_*.log 2>/dev/null || echo "no log file"
+          tail -50 scraper/logs/scrape_*.log 2>/dev/null || echo "no log"
 
       - name: Show DB stats
         if: always()
@@ -84,12 +126,13 @@ jobs:
           python3 -c "
           import sqlite3, os
           db = os.path.join('$DB_DIR', '$DB_FILE')
-          if not os.path.exists(db): exit(0)
+          if not os.path.exists(db):
+              print('no DB'); exit(0)
           c = sqlite3.connect(db)
-          print('=== Latest scrape_log ===')
+          print('=== scrape_log (last 3) ===')
           for r in c.execute('SELECT run_id, scrape_date, status, n_channels_done, n_videos_updated, n_new_videos, n_embed_changes, quota_units_used FROM scrape_log ORDER BY run_id DESC LIMIT 3'):
               print(r)
-          print('=== Today panel rows ===')
+          print('=== today panel ===')
           for t in ['channels_daily', 'videos_daily', 'embeds_daily']:
               n = c.execute(f\"SELECT COUNT(*) FROM {t} WHERE scrape_date = date('now')\").fetchone()[0]
               print(f'  {t}: {n}')
