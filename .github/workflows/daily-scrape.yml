@@ -6,6 +6,11 @@ on:
     - cron: '0 1 * * *'
   workflow_dispatch:
 
+# 동시에 1개 run만 허용. 이미 돌고 있으면 새 trigger는 queue됨.
+concurrency:
+  group: daily-scrape
+  cancel-in-progress: false
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
