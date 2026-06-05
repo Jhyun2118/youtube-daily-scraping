@@ -1,0 +1,22 @@
+# Secrets & local
+.api_key
+.env
+*.env
+
+# DB & local state (절대 commit 금지)
+*.db
+*.db-shm
+*.db-wal
+youtube_daily.db*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs
+logs/*.log
+
+# OS
+.DS_Store

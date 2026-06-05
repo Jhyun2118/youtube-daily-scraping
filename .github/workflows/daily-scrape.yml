@@ -1,0 +1,96 @@
+name: Daily YouTube Scrape
+
+on:
+  schedule:
+    # 01:00 UTC = 10:00 KST (매일)
+    - cron: '0 1 * * *'
+  workflow_dispatch:  # 수동 트리거 가능
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350  # 5h50m (GitHub 6h 한도 안쪽)
+
+    env:
+      DB_DIR: /home/runner/youtube_daily_db
+      DB_FILE: youtube_daily.db
+      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
+      YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+      YOUTUBE_DB_DIR: /home/runner/youtube_daily_db
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r scraper/requirements.txt
+
+      - name: Setup B2 CLI
+        run: |
+          pip install b2
+          b2 account authorize "$B2_KEY_ID" "$B2_APPLICATION_KEY"
+
+      - name: Download DB from B2
+        run: |
+          mkdir -p "$DB_DIR"
+          if b2 file download "b2://$B2_BUCKET/$DB_FILE" "$DB_DIR/$DB_FILE"; then
+            echo "DB downloaded: $(ls -lh $DB_DIR/$DB_FILE)"
+          else
+            echo "::warning::No existing DB on B2. Will create new from seed."
+            # 초기 시드가 없으면 워크플로우 실패. 첫 실행 전에 수동 업로드 필요.
+            exit 1
+          fi
+
+      - name: Run daily scrape
+        run: |
+          cd scraper
+          python3 scrape_daily.py
+        continue-on-error: true  # 부분 실패해도 DB 업로드는 시도
+
+      - name: Upload DB to B2
+        if: always()
+        run: |
+          b2 file upload "$B2_BUCKET" "$DB_DIR/$DB_FILE" "$DB_FILE"
+          echo "DB uploaded: $(ls -lh $DB_DIR/$DB_FILE)"
+
+      - name: Weekly snapshot (Sundays only)
+        if: success() && github.event.schedule == '0 1 * * *' && contains(fromJson('["0"]'), format('{0}', github.run_id))
+        run: |
+          # 일요일에만 스냅샷 저장 (롤백 대비)
+          DOW=$(date -u +%u)  # 1=Mon, 7=Sun
+          if [ "$DOW" = "7" ]; then
+            DATE=$(date -u +%Y-%m-%d)
+            b2 file upload "$B2_BUCKET" "$DB_DIR/$DB_FILE" "snapshots/youtube_daily_${DATE}.db"
+            echo "Weekly snapshot saved: snapshots/youtube_daily_${DATE}.db"
+          fi
+
+      - name: Show scrape log
+        if: always()
+        run: |
+          tail -50 scraper/logs/scrape_*.log 2>/dev/null || echo "no log file"
+
+      - name: Show DB stats
+        if: always()
+        run: |
+          python3 -c "
+          import sqlite3, os
+          db = os.path.join('$DB_DIR', '$DB_FILE')
+          if not os.path.exists(db): exit(0)
+          c = sqlite3.connect(db)
+          print('=== Latest scrape_log ===')
+          for r in c.execute('SELECT run_id, scrape_date, status, n_channels_done, n_videos_updated, n_new_videos, n_embed_changes, quota_units_used FROM scrape_log ORDER BY run_id DESC LIMIT 3'):
+              print(r)
+          print('=== Today panel rows ===')
+          for t in ['channels_daily', 'videos_daily', 'embeds_daily']:
+              n = c.execute(f\"SELECT COUNT(*) FROM {t} WHERE scrape_date = date('now')\").fetchone()[0]
+              print(f'  {t}: {n}')
+          "

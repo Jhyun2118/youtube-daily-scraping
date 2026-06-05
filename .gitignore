@@ -1,0 +1,32 @@
+# Secrets
+.api_key
+.env
+*.env
+
+# DB
+*.db
+*.db-shm
+*.db-wal
+youtube_daily.db*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs
+**/logs/*.log
+
+# 분석 산출물 (로컬에만 보관 — 큰 파일 + 컴퓨터 분석 캐시)
+data/
+figs/
+
+# 개인 자료 (literature review, 워킹 doc)
+Youtube_literature.xlsx
+*.docx
+*.pptx
+*.pdf
+
+# OS
+.DS_Store
