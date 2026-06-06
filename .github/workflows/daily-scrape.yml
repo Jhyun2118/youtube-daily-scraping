@@ -142,3 +142,87 @@ jobs:
               n = c.execute(f\"SELECT COUNT(*) FROM {t} WHERE scrape_date = date('now')\").fetchone()[0]
               print(f'  {t}: {n}')
           "
+
+      - name: Prepare email summary
+        if: always()
+        id: email_content
+        run: |
+          python3 - <<'PYEOF'
+          import sqlite3, os
+          db = os.path.join(os.environ["DB_DIR"], os.environ["DB_FILE"])
+          run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+
+          if not os.path.exists(db):
+              subject = "❌ Daily YouTube scrape — DB MISSING"
+              body = f"DB file not found.\n\nRun: {run_url}"
+          else:
+              c = sqlite3.connect(db)
+              r = c.execute("""
+                  SELECT scrape_date, started_at_utc, ended_at_utc, status,
+                         n_channels_done, n_channels_failed, n_videos_updated,
+                         n_new_videos, n_embeds_reparsed, n_embed_changes,
+                         quota_units_used, notes
+                  FROM scrape_log ORDER BY run_id DESC LIMIT 1
+              """).fetchone()
+              if not r:
+                  subject = "⚠️ Daily YouTube scrape — NO SCRAPE LOG"
+                  body = f"scrape_log empty.\n\nRun: {run_url}"
+              else:
+                  date, started, ended, status, n_ch, n_ch_fail, n_vid, n_new, n_emb_re, n_emb_chg, quota, notes = r
+                  icon = "✅" if status == "success" else "⚠️" if status == "partial" else "❌"
+                  subject = f"{icon} YouTube scrape {date} — {n_vid:,} videos, {n_emb_chg:,} embed changes"
+
+                  # today panel counts
+                  today_counts = {}
+                  for t in ["channels_daily", "videos_daily", "embeds_daily"]:
+                      n = c.execute(f"SELECT COUNT(*) FROM {t} WHERE scrape_date = date('now')").fetchone()[0]
+                      today_counts[t] = n
+
+                  body = f"""Daily YouTube Embed Scrape — {date}
+
+          Status: {status}
+          Started: {started}
+          Ended:   {ended}
+
+          === Stage Stats ===
+          Channels processed:    {n_ch} (failed: {n_ch_fail})
+          Videos updated:        {n_vid:,}
+          New videos:            {n_new:,}
+          Embeds re-parsed:      {n_emb_re:,}
+          Embed changes:         {n_emb_chg:,}
+          API quota used:        {quota:,} / 10,000 ({quota/100:.1f}%)
+
+          === Today panel rows ===
+          channels_daily:        {today_counts['channels_daily']:,}
+          videos_daily:          {today_counts['videos_daily']:,}
+          embeds_daily:          {today_counts['embeds_daily']:,}
+
+          === Run ===
+          {run_url}
+          """
+                  if notes:
+                      body += f"\nNotes: {notes}\n"
+
+          # Write to GITHUB_ENV (multi-line via delimiter)
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"EMAIL_SUBJECT={subject}\n")
+              f.write("EMAIL_BODY<<__BODY_EOF__\n")
+              f.write(body)
+              f.write("\n__BODY_EOF__\n")
+          print(f"Subject: {subject}")
+          print(f"Body:\n{body}")
+          PYEOF
+
+      - name: Send email notification
+        if: always()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          secure: true
+          username: ${{ secrets.GMAIL_USER }}
+          password: ${{ secrets.GMAIL_APP_PASSWORD }}
+          subject: ${{ env.EMAIL_SUBJECT }}
+          to: ${{ secrets.GMAIL_USER }}
+          from: YouTube Scraper <${{ secrets.GMAIL_USER }}>
+          body: ${{ env.EMAIL_BODY }}
