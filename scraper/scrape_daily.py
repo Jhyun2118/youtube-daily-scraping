@@ -193,21 +193,43 @@ MFLV_TITLE = re.compile(
 POPUP_FLAG = re.compile(r'compactProductListRenderer')
 URL_PAT    = re.compile(r'"urlEndpoint":\{"url":"([^"]+?)"')
 NAME_PAT   = re.compile(r'"accessibilityTitle":"([^"]+?)"')
+# 음원 attribution: "오리지널 사운드" (original) / "Song - Artist" (library) / "@channel" (creator)
+SOUND_PAT  = re.compile(r'soundAttributionTitle":\{"content":"([^"]+)"')
+# Heuristic: 'original sound' string set (다국어)
+ORIGINAL_SOUND_TOKENS = {
+    "original sound", "오리지널 사운드", "原创音频", "オリジナル音源",
+    "audio original", "son original", "originalton", "som original",
+}
 
 
 def parse_shorts_embed(video_id: str) -> Dict:
-    """Return: has_embed, embed_target_id, embed_title, ads_present, shopping_link, product_name"""
-    empty = {"has_embed": 0, "embed_target_id": None, "embed_title": None,
-             "ads_present": 0, "shopping_link": None, "product_name": None}
+    """Return: has_embed, embed_target_id, embed_title, ads_present, shopping_link, product_name,
+       sound_attribution_title, sound_is_original, http_status, video_unavailable"""
+    base = {"has_embed": 0, "embed_target_id": None, "embed_title": None,
+            "ads_present": 0, "shopping_link": None, "product_name": None,
+            "sound_attribution_title": None, "sound_is_original": None,
+            "http_status": None, "video_unavailable": None}
     try:
         r = SHORTS_SESSION.get(f"https://www.youtube.com/shorts/{video_id}",
                                timeout=config.HTML_TIMEOUT)
+        base["http_status"] = r.status_code
         if r.status_code != 200:
-            return empty
+            # 404 = 삭제, 403 = 비공개/지역제한, 기타 = 알 수 없음
+            return base
         raw = r.text
     except Exception as e:
         log.warning(f"  HTML fail {video_id}: {e}")
-        return empty
+        base["http_status"] = -1  # network error
+        return base
+
+    # HTML 안에 'video unavailable' 마커 검사 (200 OK인데 삭제/비공개 상태)
+    if ('"reason":{"simpleText":"' in raw and
+        ('Video unavailable' in raw or '비공개' in raw or 'unavailable' in raw[:50000].lower())):
+        base["video_unavailable"] = 1
+    elif '"playabilityStatus":{"status":"ERROR"' in raw or '"playabilityStatus":{"status":"UNPLAYABLE"' in raw:
+        base["video_unavailable"] = 1
+    else:
+        base["video_unavailable"] = 0
 
     # JS escape 디코드 (1MB 페이지에서 ~10ms)
     t = _decode_js_escapes(raw)
@@ -231,9 +253,24 @@ def parse_shorts_embed(video_id: str) -> Dict:
         if mn:
             product_name = mn.group(1).split(", 판매처:")[0]
 
-    return {"has_embed": has_embed, "embed_target_id": embed_target_id,
-            "embed_title": embed_title, "ads_present": int(has_ads),
-            "shopping_link": shopping_link, "product_name": product_name}
+    # 음원 추출
+    sound_title = None
+    sound_is_original = None
+    ms = SOUND_PAT.search(t)
+    if ms:
+        sound_title = ms.group(1)
+        # @로 시작 = creator audio (자체 음원), "오리지널 사운드" 등 = original
+        token_lower = sound_title.strip().lower()
+        if sound_title.startswith("@") or any(tok in token_lower for tok in ORIGINAL_SOUND_TOKENS):
+            sound_is_original = 1
+        else:
+            sound_is_original = 0  # library music / song attribution
+
+    base.update({"has_embed": has_embed, "embed_target_id": embed_target_id,
+                 "embed_title": embed_title, "ads_present": int(has_ads),
+                 "shopping_link": shopping_link, "product_name": product_name,
+                 "sound_attribution_title": sound_title, "sound_is_original": sound_is_original})
+    return base
 
 
 # ──────────── DB helpers ────────────
@@ -323,8 +360,10 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
     # embeds_daily 항상 인서트
     conn.execute("""
         INSERT INTO embeds_daily(shorts_id, scrape_date, has_embed, embed_target_id, embed_title,
-                                 ads_present, shopping_link, product_name, scraped_at_utc)
-        VALUES(?,?,?,?,?,?,?,?,?)
+                                 ads_present, shopping_link, product_name,
+                                 sound_attribution_title, sound_is_original,
+                                 http_status, video_unavailable, scraped_at_utc)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(shorts_id, scrape_date) DO UPDATE SET
           has_embed=excluded.has_embed,
           embed_target_id=excluded.embed_target_id,
@@ -332,9 +371,15 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
           ads_present=excluded.ads_present,
           shopping_link=excluded.shopping_link,
           product_name=excluded.product_name,
+          sound_attribution_title=excluded.sound_attribution_title,
+          sound_is_original=excluded.sound_is_original,
+          http_status=excluded.http_status,
+          video_unavailable=excluded.video_unavailable,
           scraped_at_utc=excluded.scraped_at_utc
     """, (shorts_id, scrape_date, em["has_embed"], em["embed_target_id"], em["embed_title"],
-          em["ads_present"], em["shopping_link"], em["product_name"], scraped_at))
+          em["ads_present"], em["shopping_link"], em["product_name"],
+          em.get("sound_attribution_title"), em.get("sound_is_original"),
+          em.get("http_status"), em.get("video_unavailable"), scraped_at))
 
     # embeds 테이블: 변경 감지
     prev = conn.execute(
@@ -375,6 +420,54 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
             changed = 1
 
     return changed
+
+
+# ──────────── Thumbnail uploader (B2) ────────────
+_b2_bucket = None
+def _get_b2_bucket():
+    """Lazy-init B2 bucket connection (only when needed)."""
+    global _b2_bucket
+    if _b2_bucket is not None:
+        return _b2_bucket
+    key_id = os.environ.get("B2_KEY_ID")
+    app_key = os.environ.get("B2_APPLICATION_KEY")
+    bucket_name = os.environ.get("B2_BUCKET", "yt-daily-jh")
+    if not (key_id and app_key):
+        return None
+    try:
+        from b2sdk.v2 import InMemoryAccountInfo, B2Api
+        info = InMemoryAccountInfo()
+        api = B2Api(info)
+        api.authorize_account("production", key_id, app_key)
+        _b2_bucket = api.get_bucket_by_name(bucket_name)
+        return _b2_bucket
+    except Exception as e:
+        log.warning(f"  B2 init failed: {e}")
+        return None
+
+def upload_thumbnail(video_id: str, thumbnail_url: str) -> bool:
+    """Download thumbnail and upload to B2 (idempotent — skips if already uploaded)."""
+    bucket = _get_b2_bucket()
+    if bucket is None:
+        return False
+    file_name = f"thumbnails/{video_id}.jpg"
+    # Check existence
+    try:
+        for fi, _ in bucket.ls(folder_to_list=file_name, recursive=False):
+            if fi.file_name == file_name:
+                return True  # already there
+    except Exception:
+        pass
+    # Download
+    try:
+        r = SHORTS_SESSION.get(thumbnail_url, timeout=10)
+        if r.status_code != 200 or len(r.content) < 1000:
+            return False
+        bucket.upload_bytes(data_bytes=r.content, file_name=file_name, content_type="image/jpeg")
+        return True
+    except Exception as e:
+        log.warning(f"  thumbnail upload fail {video_id}: {e}")
+        return False
 
 
 # ──────────── main run ────────────
@@ -436,6 +529,12 @@ def run(limit=None, dry_run=False, skip_embeds=False):
                                 for v in new_meta:
                                     upsert_new_video(conn, ci["id"], v, scraped_at)
                                     upsert_video_daily(conn, v, scrape_date, scraped_at)
+                                    # 신규 영상 썸네일 → B2 (best effort, 실패해도 진행)
+                                    sn = v.get("snippet", {}) or {}
+                                    thumbs = sn.get("thumbnails") or {}
+                                    thumb = thumbs.get("high") or thumbs.get("medium") or thumbs.get("default") or {}
+                                    if thumb.get("url"):
+                                        upload_thumbnail(v["id"], thumb["url"])
                                 stats["n_new_videos"] += len(new_meta)
                                 log.info(f"  + {ci['id']}: {len(new_meta)} new videos")
                         except QuotaExhausted:
