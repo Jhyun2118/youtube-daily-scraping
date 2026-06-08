@@ -2,8 +2,10 @@ name: Daily YouTube Scrape
 
 on:
   schedule:
-    # 01:00 UTC = 10:00 KST (매일)
-    - cron: '0 1 * * *'
+    # Primary: 01:37 UTC = 10:37 KST (정각 회피로 schedule 지연/누락 감소)
+    - cron: '37 1 * * *'
+    # Backup: 04:37 UTC = 13:37 KST (primary skip 대비 안전망)
+    - cron: '37 4 * * *'
   workflow_dispatch:
 
 # 동시에 1개 run만 허용. 이미 돌고 있으면 새 trigger는 queue됨.
@@ -88,14 +90,37 @@ jobs:
           print(f"Downloaded to {local_path} ({size/1024/1024:.1f} MB)")
           EOF
 
+      - name: Check if today already scraped
+        id: precheck
+        run: |
+          python3 - <<'PYEOF'
+          import os, sqlite3
+          db = os.path.join(os.environ["DB_DIR"], os.environ["DB_FILE"])
+          c = sqlite3.connect(db)
+          r = c.execute("""
+              SELECT status, n_videos_updated, ended_at_utc
+              FROM scrape_log
+              WHERE scrape_date = date('now') AND status = 'success'
+              ORDER BY run_id DESC LIMIT 1
+          """).fetchone()
+          skip = "true" if r else "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"skip={skip}\n")
+          if r:
+              print(f"⏭️  Today already scraped successfully ({r[1]:,} videos at {r[2]}). Skipping.")
+          else:
+              print("▶️  No success run for today yet. Proceeding.")
+          PYEOF
+
       - name: Run daily scrape
+        if: steps.precheck.outputs.skip != 'true'
         run: |
           cd scraper
           python3 scrape_daily.py
         continue-on-error: true
 
       - name: Upload DB to B2
-        if: always()
+        if: always() && steps.precheck.outputs.skip != 'true'
         run: |
           python3 - <<'EOF'
           import os, sys
@@ -146,11 +171,21 @@ jobs:
       - name: Prepare email summary
         if: always()
         id: email_content
+        env:
+          PRECHECK_SKIP: ${{ steps.precheck.outputs.skip }}
         run: |
           python3 - <<'PYEOF'
           import sqlite3, os
           db = os.path.join(os.environ["DB_DIR"], os.environ["DB_FILE"])
           run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          skipped = os.environ.get("PRECHECK_SKIP") == "true"
+
+          if skipped:
+              # Backup cron이 primary 실행 후 발화한 케이스 — 이메일 안 보냄
+              print("Skipped run (today already scraped). No email.")
+              with open(os.environ["GITHUB_ENV"], "a") as f:
+                  f.write("SEND_EMAIL=false\n")
+              raise SystemExit(0)
 
           if not os.path.exists(db):
               subject = "❌ Daily YouTube scrape — DB MISSING"
@@ -205,6 +240,7 @@ jobs:
 
           # Write to GITHUB_ENV (multi-line via delimiter)
           with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("SEND_EMAIL=true\n")
               f.write(f"EMAIL_SUBJECT={subject}\n")
               f.write("EMAIL_BODY<<__BODY_EOF__\n")
               f.write(body)
@@ -214,7 +250,7 @@ jobs:
           PYEOF
 
       - name: Send email notification
-        if: always()
+        if: always() && env.SEND_EMAIL == 'true'
         uses: dawidd6/action-send-mail@v3
         with:
           server_address: smtp.gmail.com
