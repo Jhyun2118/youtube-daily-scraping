@@ -274,6 +274,16 @@ def parse_shorts_embed(video_id: str) -> Dict:
 
 
 # ──────────── DB helpers ────────────
+def ensure_schema(conn):
+    """Idempotent schema migrations — embed target tracking 컬럼 추가."""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(scrape_log)").fetchall()}
+    for col in ("n_embed_targets_discovered", "n_embed_targets_refreshed"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE scrape_log ADD COLUMN {col} INTEGER DEFAULT 0")
+            log.info(f"  migrated: added scrape_log.{col}")
+    conn.commit()
+
+
 def get_active_channels(conn) -> List[str]:
     if config.ACTIVE_CHANNELS_ONLY_INTERSECTION:
         # YT 카테고리 라벨 있는 채널만 (= 272개)
@@ -422,6 +432,74 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
     return changed
 
 
+# ──────────── Embed target tracking (Phase 3 mechanism) ────────────
+def discover_and_track_embed_targets(conn, yt, scrape_date, scraped_at, dry_run, active_ch_ids, stats):
+    """Stage 4: Phase 3 (causal mechanism) 분석용 target longform tracking.
+
+    임베드 target은 active panel 채널 밖 영상도 많아서 stage 2가 못 잡는다.
+    여기서:
+      (A) embeds_daily에서 발견된 새 target (videos 미등록) → API로 메타 → videos+videos_daily 등록
+      (B) 기존 target 중 채널이 active panel 밖인 것들 → videos_daily 갱신
+          (panel 안 target은 stage 2가 이미 갱신함)
+    """
+    # (A) 신규 target 발견
+    new_targets = [r[0] for r in conn.execute("""
+        SELECT DISTINCT ed.embed_target_id
+        FROM embeds_daily ed
+        LEFT JOIN videos v ON v.video_id = ed.embed_target_id
+        WHERE ed.has_embed = 1
+          AND ed.embed_target_id IS NOT NULL
+          AND v.video_id IS NULL
+    """).fetchall()]
+    log.info(f"[stage 4a] embed targets to discover: {len(new_targets):,}")
+
+    if not dry_run and new_targets:
+        for chunk in batched(new_targets, config.BATCH_VIDEOS):
+            try:
+                items = yt.videos(chunk)
+                for v in items:
+                    sn = v.get("snippet", {}) or {}
+                    ch_id = sn.get("channelId")
+                    if not ch_id:
+                        continue
+                    # 채널 FK 보장 — category_yt IS NULL이라 active panel 자동 진입 안 함
+                    conn.execute("""
+                        INSERT OR IGNORE INTO channels(channel_id, channel_title, discovered_at, last_seen_at)
+                        VALUES(?,?,?,?)
+                    """, (ch_id, sn.get("channelTitle"), scraped_at, scraped_at))
+                    upsert_new_video(conn, ch_id, v, scraped_at)
+                    upsert_video_daily(conn, v, scrape_date, scraped_at)
+                    stats["n_embed_targets_discovered"] += 1
+            except QuotaExhausted:
+                raise
+            except Exception as e:
+                log.warning(f"  embed target discovery chunk failed: {e}")
+        conn.commit()
+
+    # (B) 기존 non-panel target stats 갱신
+    placeholders = ",".join("?" * len(active_ch_ids)) if active_ch_ids else "''"
+    existing_ids = [r[0] for r in conn.execute(f"""
+        SELECT DISTINCT v.video_id
+        FROM videos v
+        WHERE v.video_id IN (SELECT embed_target_id FROM embeds WHERE embed_target_id IS NOT NULL)
+          AND v.channel_id NOT IN ({placeholders})
+    """, list(active_ch_ids) if active_ch_ids else []).fetchall()]
+    log.info(f"[stage 4b] non-panel embed targets to refresh: {len(existing_ids):,}")
+
+    if not dry_run and existing_ids:
+        for chunk in batched(existing_ids, config.BATCH_VIDEOS):
+            try:
+                items = yt.videos(chunk)
+                for v in items:
+                    upsert_video_daily(conn, v, scrape_date, scraped_at)
+                    stats["n_embed_targets_refreshed"] += 1
+            except QuotaExhausted:
+                raise
+            except Exception as e:
+                log.warning(f"  embed target refresh chunk failed: {e}")
+        conn.commit()
+
+
 # ──────────── Thumbnail uploader (B2) ────────────
 _b2_bucket = None
 def _get_b2_bucket():
@@ -477,6 +555,7 @@ def run(limit=None, dry_run=False, skip_embeds=False):
 
     conn = sqlite3.connect(config.DB_PATH)
     conn.execute("PRAGMA journal_mode=WAL")
+    ensure_schema(conn)
 
     # scrape_log row 생성
     cur = conn.execute(
@@ -499,7 +578,8 @@ def run(limit=None, dry_run=False, skip_embeds=False):
 
     stats = {"n_channels_done": 0, "n_channels_failed": 0,
              "n_videos_updated": 0, "n_new_videos": 0,
-             "n_embeds_reparsed": 0, "n_embed_changes": 0}
+             "n_embeds_reparsed": 0, "n_embed_changes": 0,
+             "n_embed_targets_discovered": 0, "n_embed_targets_refreshed": 0}
 
     try:
         # ───────── 1) 채널 stats + 신규 업로드 발견 ─────────
@@ -589,6 +669,13 @@ def run(limit=None, dry_run=False, skip_embeds=False):
                         conn.commit()
                 conn.commit()
 
+        # ───────── 4) Embed target tracking (Phase 3 mechanism용) ─────────
+        if not skip_embeds:
+            log.info("[stage 4] embed target discovery + refresh")
+            discover_and_track_embed_targets(
+                conn, yt, scrape_date, scraped_at, dry_run,
+                active_ch_ids=set(active), stats=stats)
+
         status = "success"
         notes = None
     except QuotaExhausted as e:
@@ -604,10 +691,12 @@ def run(limit=None, dry_run=False, skip_embeds=False):
     conn.execute("""
         UPDATE scrape_log SET ended_at_utc=?, n_channels_done=?, n_channels_failed=?,
           n_videos_updated=?, n_new_videos=?, n_embeds_reparsed=?, n_embed_changes=?,
+          n_embed_targets_discovered=?, n_embed_targets_refreshed=?,
           quota_units_used=?, status=?, notes=? WHERE run_id=?
     """, (now_utc_iso(), stats["n_channels_done"], stats["n_channels_failed"],
           stats["n_videos_updated"], stats["n_new_videos"],
           stats["n_embeds_reparsed"], stats["n_embed_changes"],
+          stats["n_embed_targets_discovered"], stats["n_embed_targets_refreshed"],
           quota.used, status, notes, run_id))
     conn.commit()
     conn.close()
