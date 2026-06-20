@@ -78,15 +78,20 @@ CREATE INDEX IF NOT EXISTS idx_embed_target ON embeds(embed_target_id);
 
 -- Daily embed-state snapshot (audit log for embed changes)
 CREATE TABLE IF NOT EXISTS embeds_daily (
-    shorts_id           TEXT NOT NULL,
-    scrape_date         TEXT NOT NULL,
-    has_embed           INTEGER,          -- 0/1
-    embed_target_id     TEXT,
-    embed_title         TEXT,
-    ads_present         INTEGER,
-    shopping_link       TEXT,
-    product_name        TEXT,
-    scraped_at_utc      TEXT NOT NULL,
+    shorts_id               TEXT NOT NULL,
+    scrape_date             TEXT NOT NULL,
+    has_embed               INTEGER,          -- 0/1
+    embed_target_id         TEXT,
+    embed_title             TEXT,
+    ads_present             INTEGER,
+    shopping_link           TEXT,
+    product_name            TEXT,
+    sound_attribution_title TEXT,             -- 음원 제목 ("오리지널 사운드" / "Song - Artist" / NULL)
+    sound_is_original       INTEGER,          -- 1=original sound (creator), 0=library/other, NULL=unknown
+    http_status             INTEGER,          -- HTTP 상태 (200=OK, 404=삭제, 403=비공개/지역제한, -1=network err)
+    video_unavailable       INTEGER,          -- 1=200 OK인데 unavailable 마커 (private, geo-blocked 등)
+    synthetic_disclosure    INTEGER,          -- 1=AI 합성/변형 콘텐츠 공시 라벨 감지, 0=없음, NULL=미파싱/unavailable
+    scraped_at_utc          TEXT NOT NULL,
     PRIMARY KEY (shorts_id, scrape_date)
 );
 CREATE INDEX IF NOT EXISTS idx_embedday_date ON embeds_daily(scrape_date);

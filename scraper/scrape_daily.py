@@ -208,7 +208,8 @@ def parse_shorts_embed(video_id: str) -> Dict:
     base = {"has_embed": 0, "embed_target_id": None, "embed_title": None,
             "ads_present": 0, "shopping_link": None, "product_name": None,
             "sound_attribution_title": None, "sound_is_original": None,
-            "http_status": None, "video_unavailable": None}
+            "http_status": None, "video_unavailable": None,
+            "synthetic_disclosure": None}
     try:
         r = SHORTS_SESSION.get(f"https://www.youtube.com/shorts/{video_id}",
                                timeout=config.HTML_TIMEOUT)
@@ -266,10 +267,21 @@ def parse_shorts_embed(video_id: str) -> Dict:
         else:
             sound_is_original = 0  # library music / song attribution
 
+    # ── AI 합성/변형 콘텐츠 공시(synthetic content disclosure) 라벨 ──
+    # YouTube가 AI생성·변형 콘텐츠에 붙이는 공시. Stage 3가 이미 가져온 HTML을 재활용(추가 요청 0).
+    # best-effort 마커 — AI-특정 문구만(내부 feature flag 'mdx_enable_privacy_disclosure_ui' 등 제외).
+    # ★ 실제 라벨된 영상으로 정확 문구 검증 필요(현 데이터셋엔 AI콘텐츠 거의 없음). 새 마커 발견 시 추가.
+    raw_low = raw.lower()
+    SYNTH_MARKERS = ("altered or synthetic", "syntheticcontent", "alteredorsynthetic",
+                     "significantly edited or digitally generated",
+                     "sound or visuals were significantly edited")
+    synthetic_disclosure = 1 if any(mk in raw_low for mk in SYNTH_MARKERS) else 0
+
     base.update({"has_embed": has_embed, "embed_target_id": embed_target_id,
                  "embed_title": embed_title, "ads_present": int(has_ads),
                  "shopping_link": shopping_link, "product_name": product_name,
-                 "sound_attribution_title": sound_title, "sound_is_original": sound_is_original})
+                 "sound_attribution_title": sound_title, "sound_is_original": sound_is_original,
+                 "synthetic_disclosure": synthetic_disclosure})
     return base
 
 
@@ -281,6 +293,11 @@ def ensure_schema(conn):
         if col not in cols:
             conn.execute(f"ALTER TABLE scrape_log ADD COLUMN {col} INTEGER DEFAULT 0")
             log.info(f"  migrated: added scrape_log.{col}")
+    # AI 합성/변형 콘텐츠 공시(synthetic content disclosure) 라벨 — embeds_daily에 기록
+    edcols = {r[1] for r in conn.execute("PRAGMA table_info(embeds_daily)").fetchall()}
+    if "synthetic_disclosure" not in edcols:
+        conn.execute("ALTER TABLE embeds_daily ADD COLUMN synthetic_disclosure INTEGER")
+        log.info("  migrated: added embeds_daily.synthetic_disclosure")
     conn.commit()
 
 
@@ -390,8 +407,8 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
         INSERT INTO embeds_daily(shorts_id, scrape_date, has_embed, embed_target_id, embed_title,
                                  ads_present, shopping_link, product_name,
                                  sound_attribution_title, sound_is_original,
-                                 http_status, video_unavailable, scraped_at_utc)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                 http_status, video_unavailable, synthetic_disclosure, scraped_at_utc)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(shorts_id, scrape_date) DO UPDATE SET
           has_embed=excluded.has_embed,
           embed_target_id=excluded.embed_target_id,
@@ -403,11 +420,12 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
           sound_is_original=excluded.sound_is_original,
           http_status=excluded.http_status,
           video_unavailable=excluded.video_unavailable,
+          synthetic_disclosure=excluded.synthetic_disclosure,
           scraped_at_utc=excluded.scraped_at_utc
     """, (shorts_id, scrape_date, em["has_embed"], em["embed_target_id"], em["embed_title"],
           em["ads_present"], em["shopping_link"], em["product_name"],
           em.get("sound_attribution_title"), em.get("sound_is_original"),
-          em.get("http_status"), em.get("video_unavailable"), scraped_at))
+          em.get("http_status"), em.get("video_unavailable"), em.get("synthetic_disclosure"), scraped_at))
 
     # embeds 테이블: 변경 감지
     prev = conn.execute(
