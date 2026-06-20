@@ -2,6 +2,11 @@
 .api_key
 .env
 *.env
+# GCP/서비스계정 키 (private_key 포함 — 절대 커밋 금지)
+youtube-daily-scraping-*.json
+*service_account*.json
+*-credentials.json
+gcp-*.json
 
 # DB
 *.db
