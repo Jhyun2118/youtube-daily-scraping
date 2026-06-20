@@ -699,6 +699,15 @@ def run(limit=None, dry_run=False, skip_embeds=False):
           stats["n_embed_targets_discovered"], stats["n_embed_targets_refreshed"],
           quota.used, status, notes, run_id))
     conn.commit()
+    # WAL을 본 DB 파일에 완전 병합 후 비움 — 업로드 시 .db 단일 파일이 일관성을 갖도록.
+    # (이 체크포인트 없이 WAL이 남은 채 .db만 B2 업로드되면 "disk image malformed" 손상 발생)
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        integ = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integ != "ok":
+            log.error(f"integrity_check after checkpoint: {integ}")
+    except Exception as e:
+        log.error(f"wal_checkpoint failed: {e}")
     conn.close()
 
     log.info(f"=== Done | status={status} | quota={quota.used}/{config.DAILY_QUOTA_LIMIT} | {stats}")
