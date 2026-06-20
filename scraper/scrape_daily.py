@@ -21,6 +21,7 @@ import argparse
 import datetime as dt
 import logging
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Dict, Iterable
 
 import config
@@ -173,6 +174,31 @@ SHORTS_SESSION.headers.update({
                   "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept-Language": "en-US,en;q=0.9",
 })
+# 병렬 재파싱용 커넥션 풀 확대 (기본 10 → 워커 수 이상). requests.Session은
+# urllib3 풀 기반이라 read-only GET을 스레드 간 공유해도 안전.
+_pool = max(getattr(config, "EMBED_PARSE_WORKERS", 12), 10)
+_adapter = requests.adapters.HTTPAdapter(pool_connections=_pool, pool_maxsize=_pool)
+SHORTS_SESSION.mount("https://", _adapter)
+SHORTS_SESSION.mount("http://", _adapter)
+
+
+def parse_shorts_throttled(video_id: str) -> Dict:
+    """워커 스레드용: parse + per-thread throttle. (DB는 만지지 않음 → 스레드 안전)"""
+    em = parse_shorts_embed(video_id)
+    if config.HTML_THROTTLE_SEC:
+        time.sleep(config.HTML_THROTTLE_SEC)
+    return em
+
+
+def parse_shorts_parallel(sids: List[str]):
+    """sids를 병렬로 파싱해 (sid, em) 결과를 입력 순서대로 반환.
+    네트워크 파싱만 병렬; 호출부가 메인 스레드에서 순차로 DB에 기록한다."""
+    workers = max(getattr(config, "EMBED_PARSE_WORKERS", 12), 1)
+    if workers <= 1 or len(sids) <= 1:
+        return [(s, parse_shorts_throttled(s)) for s in sids]
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        ems = list(ex.map(parse_shorts_throttled, sids))
+    return list(zip(sids, ems))
 
 # Escape decode: \xNN → 해당 ASCII 문자
 ESC_PAT = re.compile(r'\\x([0-9a-fA-F]{2})')
@@ -694,15 +720,14 @@ def run(limit=None, dry_run=False, skip_embeds=False):
             log.info(f"  active shorts to re-parse: {len(all_shorts):,}")
 
             if not dry_run:
-                for sid in all_shorts:
-                    em = parse_shorts_embed(sid)
-                    changed = record_embed_state(conn, sid, em, scrape_date, scraped_at)
-                    stats["n_embeds_reparsed"] += 1
-                    stats["n_embed_changes"] += changed
-                    time.sleep(config.HTML_THROTTLE_SEC)
-                    if stats["n_embeds_reparsed"] % 100 == 0:
-                        log.info(f"    progress: {stats['n_embeds_reparsed']}/{len(all_shorts)}, changes={stats['n_embed_changes']}")
-                        conn.commit()
+                # 네트워크 파싱은 병렬, DB 기록은 메인 스레드 순차 (배치 단위 commit)
+                for batch in batched(all_shorts, 500):
+                    for sid, em in parse_shorts_parallel(batch):
+                        changed = record_embed_state(conn, sid, em, scrape_date, scraped_at)
+                        stats["n_embeds_reparsed"] += 1
+                        stats["n_embed_changes"] += changed
+                    conn.commit()
+                    log.info(f"    progress: {stats['n_embeds_reparsed']}/{len(all_shorts)}, changes={stats['n_embed_changes']}")
                 conn.commit()
 
         # ───────── 3b) 롱폼 타깃 dose 추적 (숏→롱 funnel 식별용) ─────────
@@ -714,20 +739,18 @@ def run(limit=None, dry_run=False, skip_embeds=False):
                 lf_shorts = get_longform_target_shorts(conn, scrape_date, cap)
                 log.info(f"[stage 3b] longform-target dose reparse: {len(lf_shorts):,} shorts (cap {cap})")
                 n_lf = 0
-                for sid in lf_shorts:
-                    try:
-                        em = parse_shorts_embed(sid)
-                        changed = record_embed_state(conn, sid, em, scrape_date, scraped_at)
-                        stats["n_embeds_reparsed"] += 1
-                        stats["n_embed_changes"] += changed
-                        stats["n_longform_dose_reparsed"] = stats.get("n_longform_dose_reparsed", 0) + 1
-                        n_lf += 1
-                        time.sleep(config.HTML_THROTTLE_SEC)
-                        if n_lf % 100 == 0:
-                            log.info(f"    stage3b progress: {n_lf}/{len(lf_shorts)}")
-                            conn.commit()
-                    except Exception as e:
-                        log.warning(f"  stage3b reparse fail {sid}: {e}")
+                for batch in batched(lf_shorts, 500):
+                    for sid, em in parse_shorts_parallel(batch):
+                        try:
+                            changed = record_embed_state(conn, sid, em, scrape_date, scraped_at)
+                            stats["n_embeds_reparsed"] += 1
+                            stats["n_embed_changes"] += changed
+                            stats["n_longform_dose_reparsed"] = stats.get("n_longform_dose_reparsed", 0) + 1
+                            n_lf += 1
+                        except Exception as e:
+                            log.warning(f"  stage3b reparse fail {sid}: {e}")
+                    conn.commit()
+                    log.info(f"    stage3b progress: {n_lf}/{len(lf_shorts)}")
                 conn.commit()
                 log.info(f"  stage 3b done: {n_lf:,} longform-target shorts reparsed")
 

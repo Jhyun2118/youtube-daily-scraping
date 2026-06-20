@@ -56,7 +56,9 @@ BACKOFF_BASE = 1.5
 
 # ── HTML 스크래핑 (임베드 재파싱) ────────────────────────────────
 HTML_TIMEOUT = 15
-HTML_THROTTLE_SEC = 0.3               # 요청 사이 sleep
+HTML_THROTTLE_SEC = 0.3               # 각 워커 스레드가 요청 사이 쉬는 시간
+EMBED_PARSE_WORKERS = 12              # Stage 3/3b HTML 재파싱 병렬 스레드 수
+                                      # (네트워크 파싱만 병렬; DB 쓰기는 메인 스레드 단일)
 
 # ── Quota 가드 ──────────────────────────────────────────────────
 DAILY_QUOTA_LIMIT = 10000             # YouTube API 기본
