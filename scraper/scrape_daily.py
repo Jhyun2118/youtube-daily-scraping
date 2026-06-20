@@ -311,6 +311,24 @@ def get_active_shorts(conn, channel_id: str) -> List[str]:
     return [r[0] for r in rows]
 
 
+def get_longform_target_shorts(conn, scrape_date: str, cap: int) -> List[str]:
+    """Stage 3b 대상: 롱폼(>180s) 타깃을 임베드하는 숏들.
+    오늘 이미 파싱된 숏은 제외, least-recently-seen(embeds_daily 최종 관측일) 우선 → CAP까지 rotating."""
+    thr = getattr(config, "LONGFORM_DURATION_THRESHOLD", 180)
+    rows = conn.execute("""
+        SELECT e.shorts_id, MAX(ed.scrape_date) AS last_seen
+        FROM embeds e
+        JOIN videos v ON v.video_id = e.embed_target_id
+        LEFT JOIN embeds_daily ed ON ed.shorts_id = e.shorts_id
+        WHERE v.duration_s > ?
+          AND e.shorts_id NOT IN (SELECT shorts_id FROM embeds_daily WHERE scrape_date = ?)
+        GROUP BY e.shorts_id
+        ORDER BY (last_seen IS NOT NULL), last_seen ASC
+        LIMIT ?
+    """, (thr, scrape_date, cap)).fetchall()
+    return [r[0] for r in rows]
+
+
 def upsert_channel_daily(conn, ch_item: Dict, scrape_date: str, scraped_at: str):
     st = ch_item.get("statistics", {}) or {}
     sub = None if str(st.get("hiddenSubscriberCount", "false")).lower() == "true" else safe_int(st.get("subscriberCount"))
@@ -668,6 +686,32 @@ def run(limit=None, dry_run=False, skip_embeds=False):
                         log.info(f"    progress: {stats['n_embeds_reparsed']}/{len(all_shorts)}, changes={stats['n_embed_changes']}")
                         conn.commit()
                 conn.commit()
+
+        # ───────── 3b) 롱폼 타깃 dose 추적 (숏→롱 funnel 식별용) ─────────
+        # 활성 숏(Stage 3)은 거의 숏→숏만 → 롱폼 타깃이 일별 추적에서 누락.
+        # 롱폼을 임베드하는 숏들을 rotating으로 재방문해 롱폼 타깃 일별 dose 변동 포착.
+        if not skip_embeds:
+            cap = getattr(config, "LONGFORM_DOSE_REPARSE_CAP", 0)
+            if cap > 0 and not dry_run:
+                lf_shorts = get_longform_target_shorts(conn, scrape_date, cap)
+                log.info(f"[stage 3b] longform-target dose reparse: {len(lf_shorts):,} shorts (cap {cap})")
+                n_lf = 0
+                for sid in lf_shorts:
+                    try:
+                        em = parse_shorts_embed(sid)
+                        changed = record_embed_state(conn, sid, em, scrape_date, scraped_at)
+                        stats["n_embeds_reparsed"] += 1
+                        stats["n_embed_changes"] += changed
+                        stats["n_longform_dose_reparsed"] = stats.get("n_longform_dose_reparsed", 0) + 1
+                        n_lf += 1
+                        time.sleep(config.HTML_THROTTLE_SEC)
+                        if n_lf % 100 == 0:
+                            log.info(f"    stage3b progress: {n_lf}/{len(lf_shorts)}")
+                            conn.commit()
+                    except Exception as e:
+                        log.warning(f"  stage3b reparse fail {sid}: {e}")
+                conn.commit()
+                log.info(f"  stage 3b done: {n_lf:,} longform-target shorts reparsed")
 
         # ───────── 4) Embed target tracking (Phase 3 mechanism용) ─────────
         if not skip_embeds:
