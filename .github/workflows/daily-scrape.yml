@@ -135,6 +135,19 @@ jobs:
           if not os.path.exists(local_path):
               print(f"::error::No local DB at {local_path}")
               sys.exit(1)
+
+          # ── 손상 방지: 업로드 전 WAL 체크포인트 + 무결성 검사 ──
+          # (WAL 미체크포인트 상태로 .db만 올리면 disk image malformed 발생 → 데이터 유실)
+          import sqlite3
+          conn = sqlite3.connect(local_path)
+          conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")   # WAL을 본파일에 병합 후 비움
+          ok = conn.execute("PRAGMA integrity_check").fetchone()[0]
+          conn.close()
+          if ok != "ok":
+              print(f"::error::integrity_check failed ({ok}) — 손상본 업로드 중단")
+              sys.exit(1)
+          print("integrity_check: ok (checkpointed)")
+
           size = os.path.getsize(local_path)
           print(f"Uploading {local_path} ({size/1024/1024:.1f} MB)...")
 
@@ -196,6 +209,8 @@ jobs:
                   SELECT scrape_date, started_at_utc, ended_at_utc, status,
                          n_channels_done, n_channels_failed, n_videos_updated,
                          n_new_videos, n_embeds_reparsed, n_embed_changes,
+                         COALESCE(n_embed_targets_discovered, 0),
+                         COALESCE(n_embed_targets_refreshed, 0),
                          quota_units_used, notes
                   FROM scrape_log ORDER BY run_id DESC LIMIT 1
               """).fetchone()
@@ -203,7 +218,7 @@ jobs:
                   subject = "⚠️ Daily YouTube scrape — NO SCRAPE LOG"
                   body = f"scrape_log empty.\n\nRun: {run_url}"
               else:
-                  date, started, ended, status, n_ch, n_ch_fail, n_vid, n_new, n_emb_re, n_emb_chg, quota, notes = r
+                  date, started, ended, status, n_ch, n_ch_fail, n_vid, n_new, n_emb_re, n_emb_chg, n_tgt_new, n_tgt_ref, quota, notes = r
                   icon = "✅" if status == "success" else "⚠️" if status == "partial" else "❌"
                   subject = f"{icon} YouTube scrape {date} — {n_vid:,} videos, {n_emb_chg:,} embed changes"
 
@@ -225,6 +240,8 @@ jobs:
           New videos:            {n_new:,}
           Embeds re-parsed:      {n_emb_re:,}
           Embed changes:         {n_emb_chg:,}
+          Embed targets new:     {n_tgt_new:,}
+          Embed targets refresh: {n_tgt_ref:,}
           API quota used:        {quota:,} / 10,000 ({quota/100:.1f}%)
 
           === Today panel rows ===
