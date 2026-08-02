@@ -216,6 +216,28 @@ MFLV_TITLE = re.compile(
     r'reelMultiFormatLinkViewModel":\{.*?"title":\{"content":"([^"]+)"',
     re.DOTALL,
 )
+# ★ 2026-07-16 YouTube 개편: reelMultiFormatLinkViewModel 문자열이 HTML에서 사라짐
+#   → has_embed가 전 영상 0으로 떨어짐(무증상 파손, 7/16~8/02 임베드 데이터 공백).
+#   링크카드는 reelCarouselViewModel > reelCarouselButtonViewModel 로 이동.
+#   캐러셀에는 링크 외 버튼(AI 공시 등)도 들어가므로 버튼 경계를 넘지 않도록
+#   negative lookahead로 스팬을 가둔다. 넘치면 이웃 릴의 추천 영상을 링크로 오인함.
+#   선택 규칙 = 마지막 매치. (확정링크 45개 검증: 마지막 45/45 복원, 첫 매치는 34/45)
+CAROUSEL_BTN = re.compile(
+    r'reelCarouselButtonViewModel":\{((?:(?!reelCarouselButtonViewModel).){0,3500}?)'
+    r'reelWatchEndpoint":\{"videoId":"([A-Za-z0-9_-]{11})"'
+    r'((?:(?!reelCarouselButtonViewModel).){0,1500})',
+    re.DOTALL,
+)
+# 링크카드 제목은 버튼 블록의 accessibilityText (구 MFLV의 title.content 대응)
+CAROUSEL_TITLE = re.compile(r'"accessibilityText":"([^"]{1,300})"')
+# AI 공시 배지 (2026-08-02 확인된 현행 문구) + 앵커링용 캐러셀 블록 시작점
+AI_BADGE = re.compile(r'"accessibilityText":"(AI: [^"]{0,200})"')
+AI_LEGACY = re.compile(r'altered or synthetic|syntheticContent|alteredOrSynthetic'
+                       r'|significantly edited or digitally generated', re.I)
+CAROUSEL_BLOCK = re.compile(r'reelCarouselViewModel')
+# 영상 가용성: ytInitialPlayerResponse의 playabilityStatus (OK / LOGIN_REQUIRED=비공개 / ERROR=삭제)
+PLAYABILITY = re.compile(r'"playabilityStatus":\{"status":"([A-Z_]+)"')
+AI_ANCHOR_WINDOW = 9000        # 마지막 캐러셀 블록의 유효 범위(문자)
 POPUP_FLAG = re.compile(r'compactProductListRenderer')
 URL_PAT    = re.compile(r'"urlEndpoint":\{"url":"([^"]+?)"')
 NAME_PAT   = re.compile(r'"accessibilityTitle":"([^"]+?)"')
@@ -234,8 +256,11 @@ def parse_shorts_embed(video_id: str) -> Dict:
     base = {"has_embed": 0, "embed_target_id": None, "embed_title": None,
             "ads_present": 0, "shopping_link": None, "product_name": None,
             "sound_attribution_title": None, "sound_is_original": None,
-            "http_status": None, "video_unavailable": None,
-            "synthetic_disclosure": None}
+            "sound_n_matches": None,
+            "http_status": None, "video_unavailable": None, "playability_status": None,
+            "synthetic_disclosure": None,
+            "embed_source": None, "embed_n_matches": None,
+            "ai_disclosure_raw": None, "ai_disclosure_text": None}
     try:
         r = SHORTS_SESSION.get(f"https://www.youtube.com/shorts/{video_id}",
                                timeout=config.HTML_TIMEOUT)
@@ -249,23 +274,43 @@ def parse_shorts_embed(video_id: str) -> Dict:
         base["http_status"] = -1  # network error
         return base
 
-    # HTML 안에 'video unavailable' 마커 검사 (200 OK인데 삭제/비공개 상태)
-    if ('"reason":{"simpleText":"' in raw and
-        ('Video unavailable' in raw or '비공개' in raw or 'unavailable' in raw[:50000].lower())):
-        base["video_unavailable"] = 1
-    elif '"playabilityStatus":{"status":"ERROR"' in raw or '"playabilityStatus":{"status":"UNPLAYABLE"' in raw:
-        base["video_unavailable"] = 1
-    else:
-        base["video_unavailable"] = 0
-
     # JS escape 디코드 (1MB 페이지에서 ~10ms)
     t = _decode_js_escapes(raw)
 
+    # ── 영상 가용성(삭제·비공개) 판정 ──
+    # ★2026-08-02 전면 교체. 구 조건은 `'unavailable' in raw[:50000]`이 너무 느슨해
+    #   살아있는 영상의 86%를 unavailable로 오탐하면서, 정작 API 정답지 대비 재현율은 40%(8/20)였다.
+    #   (이 컬럼으로 필터링한 분석 스크립트들이 표본의 89%를 비무작위로 날리고 있었음)
+    # YouTube는 삭제·비공개 영상에도 HTTP 200을 준다(전 패널에서 404는 단 1건) → status code로는 판정 불가.
+    # 정답 = ytInitialPlayerResponse의 playabilityStatus 첫 매치.
+    #   API 대조 검증: 생존 20/20 'OK', 삭제·비공개 20/20 'LOGIN_REQUIRED'(비공개)·'ERROR'(삭제) → 완전 분리.
+    mp = PLAYABILITY.search(t)
+    playability = mp.group(1) if mp else None
+    base["playability_status"] = playability
+    base["video_unavailable"] = None if playability is None else int(playability != "OK")
+
+    # 구 MFLV 우선 (YouTube가 되돌릴 경우 대비) → 없으면 신 캐러셀 경로
     mv = MFLV_VID.search(t)
-    mt = MFLV_TITLE.search(t)
-    has_embed = 1 if mv else 0
-    embed_target_id = mv.group(2) if mv else None
-    embed_title = mt.group(1) if mt else None
+    embed_source, embed_n_matches = None, None
+    if mv:
+        mt = MFLV_TITLE.search(t)
+        has_embed, embed_source = 1, "mflv"
+        embed_target_id = mv.group(2)
+        embed_title = mt.group(1) if mt else None
+        embed_n_matches = 1
+    else:
+        btns = list(CAROUSEL_BTN.finditer(t))
+        embed_n_matches = len(btns)
+        if btns:
+            m = btns[-1]                       # 마지막 매치 = 현재 릴의 링크카드
+            has_embed, embed_source = 1, "carousel"
+            embed_target_id = m.group(2)
+            ma = CAROUSEL_TITLE.search(m.group(1) + m.group(3))
+            embed_title = ma.group(1) if ma else None
+        else:
+            has_embed = 0
+            embed_target_id = None
+            embed_title = None
 
     has_ads = bool(POPUP_FLAG.search(t))
     shopping_link, product_name = None, None
@@ -281,11 +326,17 @@ def parse_shorts_embed(video_id: str) -> Dict:
             product_name = mn.group(1).split(", 판매처:")[0]
 
     # 음원 추출
+    # ★2026-08-02 수정: 기존엔 .search() = 페이지 첫 매치를 썼는데, Shorts 페이지엔
+    #   이웃 릴이 프리로드돼 있어 92%가 음원 문자열을 2개 갖는다(첫 매치 = 남의 음원).
+    #   판정 기준 = 같은 영상 5회 재요청 시 값 일치율(진짜 음원은 몇 분 새 안 변함):
+    #   first 16/25(64%) vs **last 25/25(100%)**. 과거 일별 데이터의 인접일 일치 62%와
+    #   first 규칙의 64%가 일치 → 기존 값의 상당수가 이웃 릴 음원이었음.
     sound_title = None
     sound_is_original = None
-    ms = SOUND_PAT.search(t)
-    if ms:
-        sound_title = ms.group(1)
+    snds = SOUND_PAT.findall(t)
+    sound_n_matches = len(snds)
+    if snds:
+        sound_title = snds[-1]
         # @로 시작 = creator audio (자체 음원), "오리지널 사운드" 등 = original
         token_lower = sound_title.strip().lower()
         if sound_title.startswith("@") or any(tok in token_lower for tok in ORIGINAL_SOUND_TOKENS):
@@ -294,20 +345,39 @@ def parse_shorts_embed(video_id: str) -> Dict:
             sound_is_original = 0  # library music / song attribution
 
     # ── AI 합성/변형 콘텐츠 공시(synthetic content disclosure) 라벨 ──
-    # YouTube가 AI생성·변형 콘텐츠에 붙이는 공시. Stage 3가 이미 가져온 HTML을 재활용(추가 요청 0).
-    # best-effort 마커 — AI-특정 문구만(내부 feature flag 'mdx_enable_privacy_disclosure_ui' 등 제외).
-    # ★ 실제 라벨된 영상으로 정확 문구 검증 필요(현 데이터셋엔 AI콘텐츠 거의 없음). 새 마커 발견 시 추가.
-    raw_low = raw.lower()
-    SYNTH_MARKERS = ("altered or synthetic", "syntheticcontent", "alteredorsynthetic",
-                     "significantly edited or digitally generated",
-                     "sound or visuals were significantly edited")
-    synthetic_disclosure = 1 if any(mk in raw_low for mk in SYNTH_MARKERS) else 0
+    # ★2026-08-02 정정: 구 마커('altered or synthetic' 등)는 현행 HTML에 존재하지 않음
+    #   (무작위 150개 검사 0/150). 전 기간 0으로 기록된 건 "AI 콘텐츠 부재"가 아니라 측정 실패였음.
+    #   현행 라벨 = 캐러셀의 INFO 버튼: {"iconName":"INFO","title":"AI",
+    #                                   "accessibilityText":"AI: Content was made with AI"}
+    # ★앵커링 필수: Shorts 페이지엔 이웃 릴이 프리로드돼 있어 페이지 전체 검색은 남의 배지를 잡는다.
+    #   링크카드와 동일하게 '마지막 캐러셀 블록' 안에 있을 때만 이 영상 것으로 인정.
+    # ⚠️ 정확도 미검증: 라벨 확실한 정답지가 없어 재요청 3회 일관성(29/30)만 확인된 상태.
+    #   따라서 원자료(ai_disclosure_raw/_text)를 함께 남겨 나중에 규칙을 바꿔 재산출할 수 있게 한다.
+    badges = list(AI_BADGE.finditer(t))
+    car_starts = [m.start() for m in CAROUSEL_BLOCK.finditer(t)]
+    ai_raw_hits = len(badges)
+    ai_text = badges[-1].group(1) if badges else None
+    synthetic_disclosure = 0
+    if badges and car_starts:
+        last_car = car_starts[-1]
+        if any(last_car <= m.start() < last_car + AI_ANCHOR_WINDOW for m in badges):
+            synthetic_disclosure = 1
+    # 구 마커가 되살아나면(YouTube 롤백) 침묵하지 않도록 흔적을 남긴다 — 앵커 측정에는 넣지 않음
+    if not badges:
+        legacy = AI_LEGACY.search(raw)
+        if legacy:
+            ai_text = "LEGACY:" + legacy.group(0)[:120]
+            ai_raw_hits = -1
 
     base.update({"has_embed": has_embed, "embed_target_id": embed_target_id,
-                 "embed_title": embed_title, "ads_present": int(has_ads),
+                 "embed_title": embed_title,
+                 "embed_source": embed_source, "embed_n_matches": embed_n_matches,
+                 "ads_present": int(has_ads),
                  "shopping_link": shopping_link, "product_name": product_name,
                  "sound_attribution_title": sound_title, "sound_is_original": sound_is_original,
-                 "synthetic_disclosure": synthetic_disclosure})
+                 "sound_n_matches": sound_n_matches,
+                 "synthetic_disclosure": synthetic_disclosure,
+                 "ai_disclosure_raw": ai_raw_hits, "ai_disclosure_text": ai_text})
     return base
 
 
@@ -324,6 +394,30 @@ def ensure_schema(conn):
     if "synthetic_disclosure" not in edcols:
         conn.execute("ALTER TABLE embeds_daily ADD COLUMN synthetic_disclosure INTEGER")
         log.info("  migrated: added embeds_daily.synthetic_disclosure")
+    # 임베드 추출 출처('mflv'|'carousel') + 페이지 내 캐러셀 버튼 매치 수.
+    # 분석 시 오탐 필터용 감사 컬럼 — 매치 2개 이상이면 이웃 릴 혼입 가능성 검토.
+    if "embed_source" not in edcols:
+        conn.execute("ALTER TABLE embeds_daily ADD COLUMN embed_source TEXT")
+        log.info("  migrated: added embeds_daily.embed_source")
+    if "embed_n_matches" not in edcols:
+        conn.execute("ALTER TABLE embeds_daily ADD COLUMN embed_n_matches INTEGER")
+        log.info("  migrated: added embeds_daily.embed_n_matches")
+    # AI 공시 원자료 — synthetic_disclosure(앵커링 결과)와 별도로 페이지 전체 검출수·문구 보존.
+    # 앵커 규칙이 틀린 것으로 판명나도 이 두 컬럼으로 재산출 가능하게 하기 위함.
+    if "ai_disclosure_raw" not in edcols:
+        conn.execute("ALTER TABLE embeds_daily ADD COLUMN ai_disclosure_raw INTEGER")
+        log.info("  migrated: added embeds_daily.ai_disclosure_raw")
+    if "ai_disclosure_text" not in edcols:
+        conn.execute("ALTER TABLE embeds_daily ADD COLUMN ai_disclosure_text TEXT")
+        log.info("  migrated: added embeds_daily.ai_disclosure_text")
+    # 페이지 내 음원 문자열 개수 — 2 이상이면 이웃 릴 혼입 구간(=선택 규칙이 실제로 작동한 행)
+    if "sound_n_matches" not in edcols:
+        conn.execute("ALTER TABLE embeds_daily ADD COLUMN sound_n_matches INTEGER")
+        log.info("  migrated: added embeds_daily.sound_n_matches")
+    # 가용성 원자료 — video_unavailable(0/1)의 근거 문자열. OK/LOGIN_REQUIRED/ERROR 구분 보존
+    if "playability_status" not in edcols:
+        conn.execute("ALTER TABLE embeds_daily ADD COLUMN playability_status TEXT")
+        log.info("  migrated: added embeds_daily.playability_status")
     conn.commit()
 
 
@@ -432,9 +526,11 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
     conn.execute("""
         INSERT INTO embeds_daily(shorts_id, scrape_date, has_embed, embed_target_id, embed_title,
                                  ads_present, shopping_link, product_name,
-                                 sound_attribution_title, sound_is_original,
-                                 http_status, video_unavailable, synthetic_disclosure, scraped_at_utc)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                 sound_attribution_title, sound_is_original, sound_n_matches,
+                                 http_status, video_unavailable, playability_status, synthetic_disclosure,
+                                 embed_source, embed_n_matches,
+                                 ai_disclosure_raw, ai_disclosure_text, scraped_at_utc)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(shorts_id, scrape_date) DO UPDATE SET
           has_embed=excluded.has_embed,
           embed_target_id=excluded.embed_target_id,
@@ -444,14 +540,23 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
           product_name=excluded.product_name,
           sound_attribution_title=excluded.sound_attribution_title,
           sound_is_original=excluded.sound_is_original,
+          sound_n_matches=excluded.sound_n_matches,
           http_status=excluded.http_status,
           video_unavailable=excluded.video_unavailable,
+          playability_status=excluded.playability_status,
           synthetic_disclosure=excluded.synthetic_disclosure,
+          embed_source=excluded.embed_source,
+          embed_n_matches=excluded.embed_n_matches,
+          ai_disclosure_raw=excluded.ai_disclosure_raw,
+          ai_disclosure_text=excluded.ai_disclosure_text,
           scraped_at_utc=excluded.scraped_at_utc
     """, (shorts_id, scrape_date, em["has_embed"], em["embed_target_id"], em["embed_title"],
           em["ads_present"], em["shopping_link"], em["product_name"],
-          em.get("sound_attribution_title"), em.get("sound_is_original"),
-          em.get("http_status"), em.get("video_unavailable"), em.get("synthetic_disclosure"), scraped_at))
+          em.get("sound_attribution_title"), em.get("sound_is_original"), em.get("sound_n_matches"),
+          em.get("http_status"), em.get("video_unavailable"), em.get("playability_status"),
+          em.get("synthetic_disclosure"),
+          em.get("embed_source"), em.get("embed_n_matches"),
+          em.get("ai_disclosure_raw"), em.get("ai_disclosure_text"), scraped_at))
 
     # embeds 테이블: 변경 감지
     prev = conn.execute(

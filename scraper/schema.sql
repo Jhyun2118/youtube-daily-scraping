@@ -88,9 +88,15 @@ CREATE TABLE IF NOT EXISTS embeds_daily (
     product_name            TEXT,
     sound_attribution_title TEXT,             -- 음원 제목 ("오리지널 사운드" / "Song - Artist" / NULL)
     sound_is_original       INTEGER,          -- 1=original sound (creator), 0=library/other, NULL=unknown
+    sound_n_matches         INTEGER,          -- 페이지 내 음원 문자열 수(2+ = 이웃 릴 혼입). ★2026-08-02 이전 값은 first-match라 최대 60% 오류
     http_status             INTEGER,          -- HTTP 상태 (200=OK, 404=삭제, 403=비공개/지역제한, -1=network err)
-    video_unavailable       INTEGER,          -- 1=200 OK인데 unavailable 마커 (private, geo-blocked 등)
-    synthetic_disclosure    INTEGER,          -- 1=AI 합성/변형 콘텐츠 공시 라벨 감지, 0=없음, NULL=미파싱/unavailable
+    video_unavailable       INTEGER,          -- 1=삭제/비공개. ★2026-08-02 판정 교체(playabilityStatus). 이전 값은 오탐 86%라 무효
+    playability_status      TEXT,             -- OK / LOGIN_REQUIRED(비공개) / ERROR(삭제) — video_unavailable의 근거
+    synthetic_disclosure    INTEGER,          -- 1=AI 공시 라벨(앵커링 확인), 0=없음, NULL=미파싱. ★2026-08-02 이전 값은 마커 오류로 전부 0 = 무효
+    ai_disclosure_raw       INTEGER,          -- 페이지 전체 AI 배지 검출 수(앵커링 전 원자료). -1=구 마커만 발견
+    ai_disclosure_text      TEXT,             -- 검출된 공시 문구 원본 (마커 재변경 감지용)
+    embed_source            TEXT,             -- 'mflv'(구 파서) / 'carousel'(2026-07-16 개편 후) / NULL
+    embed_n_matches         INTEGER,          -- 페이지 내 캐러셀 링크버튼 매치 수 (2+면 이웃 릴 혼입 검토)
     scraped_at_utc          TEXT NOT NULL,
     PRIMARY KEY (shorts_id, scrape_date)
 );
