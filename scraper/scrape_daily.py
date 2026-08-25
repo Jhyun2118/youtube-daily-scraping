@@ -284,10 +284,23 @@ def parse_shorts_embed(video_id: str) -> Dict:
     # YouTube는 삭제·비공개 영상에도 HTTP 200을 준다(전 패널에서 404는 단 1건) → status code로는 판정 불가.
     # 정답 = ytInitialPlayerResponse의 playabilityStatus 첫 매치.
     #   API 대조 검증: 생존 20/20 'OK', 삭제·비공개 20/20 'LOGIN_REQUIRED'(비공개)·'ERROR'(삭제) → 완전 분리.
+    # ★★ 2026-08-02 재정정: 'OK가 아니면 사망'은 틀렸다. UNPLAYABLE은 영상 상태가 아니라
+    #   **우리 쪽 요청이 스로틀(봇 탐지)에 걸렸다는 신호**다. 실측: 프로덕션 설정(12워커·6req/s)에서
+    #   400건까지 OK 99% → 600건 56% → 800건 4% → 1,400건 이후 0%로 붕괴하고 회복하지 않는다.
+    #   UNPLAYABLE 표본을 API로 조회하면 40/40 생존, 느리게 재요청하면 12/12 OK로 복귀했다.
+    #   따라서 매일 3.8만 페이지를 긁는 본 스크랩은 대부분 구간이 UNPLAYABLE로 찍힌다.
+    #   ※ 같은 영상 짝 비교(정상 vs 스로틀) 결과 음원 40/40·AI배지 40/40 일치, 확정링크 타깃도
+    #     99% 일치 → 스로틀 페이지라도 초점 릴의 데이터 자체는 유효하다. 차단되는 건 플레이어뿐.
+    #   그러므로 스로틀 구간은 '사망 판정 불가(NULL)'로 두고 데이터는 그대로 쓴다.
     mp = PLAYABILITY.search(t)
     playability = mp.group(1) if mp else None
     base["playability_status"] = playability
-    base["video_unavailable"] = None if playability is None else int(playability != "OK")
+    if playability == "OK":
+        base["video_unavailable"] = 0
+    elif playability in ("LOGIN_REQUIRED", "ERROR"):   # 비공개 / 삭제 (API 대조 검증 완료)
+        base["video_unavailable"] = 1
+    else:                                             # UNPLAYABLE·미지값 = 판정 불가
+        base["video_unavailable"] = None
 
     # 구 MFLV 우선 (YouTube가 되돌릴 경우 대비) → 없으면 신 캐러셀 경로
     mv = MFLV_VID.search(t)
@@ -748,6 +761,17 @@ def run(limit=None, dry_run=False, skip_embeds=False):
              "n_embeds_reparsed": 0, "n_embed_changes": 0,
              "n_embed_targets_discovered": 0, "n_embed_targets_refreshed": 0}
 
+    # ★2026-08-25 구조 변경 — 쿼터 의존/비의존 구간 분리.
+    #   구 구조는 stage 1~4를 단일 try로 묶어, stage 1/2에서 QuotaExhausted가 발생하면
+    #   API 쿼터를 전혀 쓰지 않는 stage 3·3b(HTML 파싱)까지 함께 건너뛰었다.
+    #   그 결과 2026-08-11~14·08-18~25 총 12일간 B2 권위본의 embeds_daily가 0행으로 남았다
+    #   (임베드 상태는 소급 수집이 불가능한 값이라 그날치는 영구 손실).
+    #   이제 stage 3·3b는 쿼터 상태와 무관하게 수행하고, 실제로 API가 필요한 stage 4만 건너뛴다.
+    status = "success"
+    notes = None
+    quota_dead = False
+
+    # ── 쿼터 의존 구간: stage 1~2 ──
     try:
         # ───────── 1) 채널 stats + 신규 업로드 발견 ─────────
         log.info("[stage 1] channel stats + new uploads discovery")
@@ -816,6 +840,16 @@ def run(limit=None, dry_run=False, skip_embeds=False):
                     log.error(f"  video chunk failed: {e}")
             conn.commit()
 
+    except QuotaExhausted as e:
+        log.warning(f"  quota exhausted: {e}")
+        status, notes, quota_dead = "partial", str(e), True
+    except Exception as e:
+        log.exception(f"  fatal: {e}")
+        status, notes = "failed", str(e)
+
+    # ── 쿼터 비의존 구간: stage 3·3b (youtube.com HTML 파싱, API 콜 0) ──
+    #   쿼터가 고갈됐더라도 반드시 수행한다.
+    try:
         # ───────── 3) Shorts embed 재파싱 ─────────
         if not skip_embeds:
             log.info("[stage 3] re-parse Shorts embeds (HTML)")
@@ -859,23 +893,30 @@ def run(limit=None, dry_run=False, skip_embeds=False):
                 conn.commit()
                 log.info(f"  stage 3b done: {n_lf:,} longform-target shorts reparsed")
 
-        # ───────── 4) Embed target tracking (Phase 3 mechanism용) ─────────
-        if not skip_embeds:
-            log.info("[stage 4] embed target discovery + refresh")
-            discover_and_track_embed_targets(
-                conn, yt, scrape_date, scraped_at, dry_run,
-                active_ch_ids=set(active), stats=stats)
+    except Exception as e:
+        log.exception(f"  stage 3/3b failed: {e}")
+        if status == "success":
+            status, notes = "failed", str(e)
 
-        status = "success"
-        notes = None
+    # ── 쿼터 의존 구간: stage 4 ──
+    try:
+        if quota_dead:
+            log.warning("[stage 4] 쿼터 고갈로 건너뜀 — embed target discovery/refresh는 API 필요")
+        else:
+            # ───────── 4) Embed target tracking (Phase 3 mechanism용) ─────────
+            if not skip_embeds:
+                log.info("[stage 4] embed target discovery + refresh")
+                discover_and_track_embed_targets(
+                    conn, yt, scrape_date, scraped_at, dry_run,
+                    active_ch_ids=set(active), stats=stats)
+
     except QuotaExhausted as e:
         log.warning(f"  quota exhausted: {e}")
-        status = "partial"
-        notes = str(e)
+        status, notes, quota_dead = "partial", str(e), True
     except Exception as e:
         log.exception(f"  fatal: {e}")
-        status = "failed"
-        notes = str(e)
+        if status == "success":
+            status, notes = "failed", str(e)
 
     # log row 마무리
     conn.execute("""
