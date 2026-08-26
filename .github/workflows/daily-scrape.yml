@@ -95,21 +95,31 @@ jobs:
         run: |
           python3 - <<'PYEOF'
           import os, sqlite3
+          # ★2026-08-26 게이트 변경 — status='success' → "오늘 stage 3가 이미 돌았는가".
+          #   09f88cf 이후 stage 3·3b는 쿼터와 무관하게 수행되지만, 쿼터가 마르면 stage 4를
+          #   건너뛰므로 status는 영원히 'partial'이다. 그래서 backup cron이 skip되지 않고
+          #   숏 51,268개의 HTML 재파싱(2h20m)을 하루에 두 번 돌았다(2026-08-26 실측).
+          #   embeds_daily는 (shorts_id, scrape_date) upsert라 행이 늘지는 않지만, embeds
+          #   엣지 테이블이 같은 날 두 번의 상태 전이를 기록해 8/26에 17,051건이 찍혔다
+          #   (2차 패스에서만 9,127건 = 2시간 간격 재측정 불일치 17.8%).
+          #   scrape_log UPDATE는 실행 끝에 일어나므로, 1차가 stage 3 도중 죽으면 값이 0으로
+          #   남아 backup이 정상 재실행한다 — primary 누락 대비라는 본래 목적은 유지된다.
           db = os.path.join(os.environ["DB_DIR"], os.environ["DB_FILE"])
           c = sqlite3.connect(db)
           r = c.execute("""
-              SELECT status, n_videos_updated, ended_at_utc
+              SELECT status, n_embeds_reparsed, ended_at_utc
               FROM scrape_log
-              WHERE scrape_date = date('now') AND status = 'success'
+              WHERE scrape_date = date('now')
+                AND (status = 'success' OR n_embeds_reparsed > 0)
               ORDER BY run_id DESC LIMIT 1
           """).fetchone()
           skip = "true" if r else "false"
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"skip={skip}\n")
           if r:
-              print(f"⏭️  Today already scraped successfully ({r[1]:,} videos at {r[2]}). Skipping.")
+              print(f"⏭️  Today already scraped (status={r[0]}, embeds re-parsed {r[1]:,} at {r[2]}). Skipping.")
           else:
-              print("▶️  No success run for today yet. Proceeding.")
+              print("▶️  No completed scrape for today yet. Proceeding.")
           PYEOF
 
       - name: Run daily scrape
