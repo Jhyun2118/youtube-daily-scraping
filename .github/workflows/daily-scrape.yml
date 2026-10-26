@@ -14,6 +14,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ★2026-10-26 — repo 활동 60일 없으면 GitHub가 schedule을 자동 비활성화(10/25 실제 발생).
+  #   커밋 없이 API로 이 workflow를 다시 enable해 비활성화 타이머를 갱신한다.
+  #   scrape job과 분리해서 scrape가 skip·실패해도 돈다.
+  keepalive:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/${{ github.repository }}/actions/workflows/daily-scrape.yml/enable"
+          echo "Workflow re-enabled (inactivity timer refreshed)."
+
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 350
