@@ -230,6 +230,22 @@ CAROUSEL_BTN = re.compile(
 )
 # 링크카드 제목은 버튼 블록의 accessibilityText (구 MFLV의 title.content 대응)
 CAROUSEL_TITLE = re.compile(r'"accessibilityText":"([^"]{1,300})"')
+# ★★ 2026-11-02 링크카드 파서 교체 (v3). CAROUSEL_BTN에는 결함이 둘 있었다.
+#   (1) 타깃이 롱폼이면 버튼이 reelWatchEndpoint가 아니라 watchEndpoint를 쓴다 → 숏→롱 링크 전부 누락.
+#       파일럿 감사 HTML(10/29) 링크카드 120쪽 중 107쪽이 watchEndpoint, 타깃 112개 전부 비숏.
+#   (2) ytInitialData 앞에 프리로드된 이웃 릴들의 링크카드까지 잡아 '마지막 매치'가 남의 링크가 됨.
+#       같은 숏 재요청 시 구 규칙 타깃 14/20 변동, v3 20/20 고정.
+#   v3 = ytInitialData 구간 안에서 accessibilityId "id.reel_multi_format_link" 버튼만 인정
+#       (이 구간엔 링크카드 버튼이 0개 또는 1개뿐: 241쪽 실측). 엔드포인트 종류는 embed_target_kind로 보존.
+#   ⚠️ 7/16~11/02 carousel 값은 이웃 릴 오탐이 섞여 있고 롱폼 링크가 빠져 있다. 분석 시 embed_source로 구분할 것.
+LINKCARD_BTN = re.compile(
+    r'"onTap":\{"innertubeCommand":\{((?:(?!"onTap":).){0,4000}?)'
+    r'"accessibilityText":"([^"]{0,300})"(?:(?!"onTap":).){0,400}?'
+    r'"accessibilityId":"id\.reel_multi_format_link"',
+    re.DOTALL,
+)
+LINKCARD_EP = re.compile(r'"(reelWatchEndpoint|watchEndpoint)":\{"videoId":"([A-Za-z0-9_-]{11})"')
+INITIAL_DATA_MARK = "var ytInitialData"
 # AI 공시 배지 (2026-08-02 확인된 현행 문구) + 앵커링용 캐러셀 블록 시작점
 AI_BADGE = re.compile(r'"accessibilityText":"(AI: [^"]{0,200})"')
 AI_LEGACY = re.compile(r'altered or synthetic|syntheticContent|alteredOrSynthetic'
@@ -253,13 +269,14 @@ ORIGINAL_SOUND_TOKENS = {
 def parse_shorts_embed(video_id: str) -> Dict:
     """Return: has_embed, embed_target_id, embed_title, ads_present, shopping_link, product_name,
        sound_attribution_title, sound_is_original, http_status, video_unavailable"""
-    base = {"has_embed": 0, "embed_target_id": None, "embed_title": None,
+    # has_embed 기본값 NULL: 요청 실패(non-200·네트워크)는 '링크 없음'이 아니라 '측정 못 함'이다 (2026-11-02)
+    base = {"has_embed": None, "embed_target_id": None, "embed_title": None,
             "ads_present": 0, "shopping_link": None, "product_name": None,
             "sound_attribution_title": None, "sound_is_original": None,
             "sound_n_matches": None,
             "http_status": None, "video_unavailable": None, "playability_status": None,
             "synthetic_disclosure": None,
-            "embed_source": None, "embed_n_matches": None,
+            "embed_source": None, "embed_n_matches": None, "embed_target_kind": None,
             "ai_disclosure_raw": None, "ai_disclosure_text": None}
     try:
         r = SHORTS_SESSION.get(f"https://www.youtube.com/shorts/{video_id}",
@@ -302,28 +319,30 @@ def parse_shorts_embed(video_id: str) -> Dict:
     else:                                             # UNPLAYABLE·미지값 = 판정 불가
         base["video_unavailable"] = None
 
-    # 구 MFLV 우선 (YouTube가 되돌릴 경우 대비) → 없으면 신 캐러셀 경로
-    mv = MFLV_VID.search(t)
-    embed_source, embed_n_matches = None, None
-    if mv:
-        mt = MFLV_TITLE.search(t)
-        has_embed, embed_source = 1, "mflv"
-        embed_target_id = mv.group(2)
-        embed_title = mt.group(1) if mt else None
-        embed_n_matches = 1
+    # 링크카드 v3: ytInitialData 구간의 id.reel_multi_format_link 버튼 (위 LINKCARD_BTN 주석 참조).
+    # 구 MFLV는 2026-07-16 이후 HTML에 없지만, YouTube가 되돌릴 경우 침묵하지 않도록 흔적만 남긴다.
+    embed_source, embed_n_matches, embed_target_kind = None, None, None
+    has_embed, embed_target_id, embed_title = 0, None, None
+    i0 = t.find(INITIAL_DATA_MARK)
+    if i0 < 0:
+        # 초점 릴 구간을 못 찾음 = 측정 실패. 0(링크 없음)으로 쓰면 가짜 링크 종료가 기록되므로 NULL.
+        has_embed, embed_source = None, "no_initial_data"
     else:
-        btns = list(CAROUSEL_BTN.finditer(t))
+        btns = list(LINKCARD_BTN.finditer(t, i0))
         embed_n_matches = len(btns)
         if btns:
-            m = btns[-1]                       # 마지막 매치 = 현재 릴의 링크카드
-            has_embed, embed_source = 1, "carousel"
-            embed_target_id = m.group(2)
-            ma = CAROUSEL_TITLE.search(m.group(1) + m.group(3))
-            embed_title = ma.group(1) if ma else None
-        else:
-            has_embed = 0
-            embed_target_id = None
-            embed_title = None
+            m = btns[0]
+            ep = LINKCARD_EP.search(m.group(1))
+            if ep:
+                has_embed, embed_source = 1, "linkcard_v3"
+                embed_target_kind = "short" if ep.group(1) == "reelWatchEndpoint" else "watch"
+                embed_target_id = ep.group(2)
+                embed_title = m.group(2) or None
+            else:
+                # 링크카드 버튼은 있는데 영상 엔드포인트가 없음(채널·외부 링크 등 신형식 가능성)
+                has_embed, embed_source = None, "linkcard_v3_no_endpoint"
+        elif MFLV_VID.search(t):
+            embed_source = "mflv_seen_unparsed"
 
     has_ads = bool(POPUP_FLAG.search(t))
     shopping_link, product_name = None, None
@@ -385,6 +404,7 @@ def parse_shorts_embed(video_id: str) -> Dict:
     base.update({"has_embed": has_embed, "embed_target_id": embed_target_id,
                  "embed_title": embed_title,
                  "embed_source": embed_source, "embed_n_matches": embed_n_matches,
+                 "embed_target_kind": embed_target_kind,
                  "ads_present": int(has_ads),
                  "shopping_link": shopping_link, "product_name": product_name,
                  "sound_attribution_title": sound_title, "sound_is_original": sound_is_original,
@@ -428,6 +448,10 @@ def ensure_schema(conn):
         conn.execute("ALTER TABLE embeds_daily ADD COLUMN sound_n_matches INTEGER")
         log.info("  migrated: added embeds_daily.sound_n_matches")
     # 가용성 원자료 — video_unavailable(0/1)의 근거 문자열. OK/LOGIN_REQUIRED/ERROR 구분 보존
+    # 링크카드 타깃 종류(v3, 2026-11-02): 'short'=reelWatchEndpoint / 'watch'=watchEndpoint(롱폼 등 비숏)
+    if "embed_target_kind" not in edcols:
+        conn.execute("ALTER TABLE embeds_daily ADD COLUMN embed_target_kind TEXT")
+        log.info("  migrated: added embeds_daily.embed_target_kind")
     if "playability_status" not in edcols:
         conn.execute("ALTER TABLE embeds_daily ADD COLUMN playability_status TEXT")
         log.info("  migrated: added embeds_daily.playability_status")
@@ -541,9 +565,9 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
                                  ads_present, shopping_link, product_name,
                                  sound_attribution_title, sound_is_original, sound_n_matches,
                                  http_status, video_unavailable, playability_status, synthetic_disclosure,
-                                 embed_source, embed_n_matches,
+                                 embed_source, embed_n_matches, embed_target_kind,
                                  ai_disclosure_raw, ai_disclosure_text, scraped_at_utc)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(shorts_id, scrape_date) DO UPDATE SET
           has_embed=excluded.has_embed,
           embed_target_id=excluded.embed_target_id,
@@ -560,6 +584,7 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
           synthetic_disclosure=excluded.synthetic_disclosure,
           embed_source=excluded.embed_source,
           embed_n_matches=excluded.embed_n_matches,
+          embed_target_kind=excluded.embed_target_kind,
           ai_disclosure_raw=excluded.ai_disclosure_raw,
           ai_disclosure_text=excluded.ai_disclosure_text,
           scraped_at_utc=excluded.scraped_at_utc
@@ -568,7 +593,7 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
           em.get("sound_attribution_title"), em.get("sound_is_original"), em.get("sound_n_matches"),
           em.get("http_status"), em.get("video_unavailable"), em.get("playability_status"),
           em.get("synthetic_disclosure"),
-          em.get("embed_source"), em.get("embed_n_matches"),
+          em.get("embed_source"), em.get("embed_n_matches"), em.get("embed_target_kind"),
           em.get("ai_disclosure_raw"), em.get("ai_disclosure_text"), scraped_at))
 
     # embeds 테이블: 변경 감지
@@ -579,6 +604,9 @@ def record_embed_state(conn, shorts_id: str, em: Dict, scrape_date: str, scraped
     prev_targets = {r[0] for r in prev}
     new_target = em["embed_target_id"]
     changed = 0
+    if em["has_embed"] is None:
+        # 측정 실패(요청 실패·초점 릴 구간 없음): 엣지 상태를 건드리지 않는다. 0으로 처리하면 가짜 링크 종료가 생김.
+        return 0
 
     if em["has_embed"] and new_target:
         if new_target not in prev_targets:

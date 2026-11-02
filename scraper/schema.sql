@@ -95,7 +95,8 @@ CREATE TABLE IF NOT EXISTS embeds_daily (
     synthetic_disclosure    INTEGER,          -- 1=AI 공시 라벨(앵커링 확인), 0=없음, NULL=미파싱. ★2026-08-02 이전 값은 마커 오류로 전부 0 = 무효
     ai_disclosure_raw       INTEGER,          -- 페이지 전체 AI 배지 검출 수(앵커링 전 원자료). -1=구 마커만 발견
     ai_disclosure_text      TEXT,             -- 검출된 공시 문구 원본 (마커 재변경 감지용)
-    embed_source            TEXT,             -- 'mflv'(구 파서) / 'carousel'(2026-07-16 개편 후) / NULL
+    embed_source            TEXT,             -- 'mflv'(구 파서) / 'carousel'(7/16~11/02, 이웃 릴 오탐+롱폼 누락) / 'linkcard_v3'(11/02~) / 'no_initial_data'·'linkcard_v3_no_endpoint'(측정 실패, has_embed NULL)
+    embed_target_kind       TEXT,             -- v3만: 'short'(reelWatchEndpoint) / 'watch'(watchEndpoint, 비숏)
     embed_n_matches         INTEGER,          -- 페이지 내 캐러셀 링크버튼 매치 수 (2+면 이웃 릴 혼입 검토)
     scraped_at_utc          TEXT NOT NULL,
     PRIMARY KEY (shorts_id, scrape_date)
