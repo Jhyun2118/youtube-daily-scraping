@@ -363,12 +363,16 @@ def parse_shorts_embed(video_id: str) -> Dict:
     #   판정 기준 = 같은 영상 5회 재요청 시 값 일치율(진짜 음원은 몇 분 새 안 변함):
     #   first 16/25(64%) vs **last 25/25(100%)**. 과거 일별 데이터의 인접일 일치 62%와
     #   first 규칙의 64%가 일치 → 기존 값의 상당수가 이웃 릴 음원이었음.
+    # ★2026-11-03 재수정: '마지막 매치'는 초점 숏에 음원 표기가 있을 때만 맞다. 이웃 릴은 ytInitialData
+    #   앞에 있고 ytInitialData 안의 음원 표기는 0개 또는 1개(감사 241쪽: 213쪽 1개, 28쪽 0개).
+    #   초점 숏에 표기가 없으면 '마지막 매치'가 이웃 음원(주로 Original Sound)을 잡았다(18/241 = 7.5%).
+    #   이제 링크카드와 같이 ytInitialData 구간의 첫 매치만 쓰고, 구간을 못 찾으면 NULL(측정 실패).
     sound_title = None
     sound_is_original = None
-    snds = SOUND_PAT.findall(t)
-    sound_n_matches = len(snds)
+    snds = SOUND_PAT.findall(t, i0) if i0 >= 0 else []
+    sound_n_matches = len(snds) if i0 >= 0 else None
     if snds:
-        sound_title = snds[-1]
+        sound_title = snds[0]
         # @로 시작 = creator audio (자체 음원), "오리지널 사운드" 등 = original
         token_lower = sound_title.strip().lower()
         if sound_title.startswith("@") or any(tok in token_lower for tok in ORIGINAL_SOUND_TOKENS):
@@ -385,15 +389,15 @@ def parse_shorts_embed(video_id: str) -> Dict:
     #   링크카드와 동일하게 '마지막 캐러셀 블록' 안에 있을 때만 이 영상 것으로 인정.
     # ⚠️ 정확도 미검증: 라벨 확실한 정답지가 없어 재요청 3회 일관성(29/30)만 확인된 상태.
     #   따라서 원자료(ai_disclosure_raw/_text)를 함께 남겨 나중에 규칙을 바꿔 재산출할 수 있게 한다.
+    # ★2026-11-03 재수정: '마지막 캐러셀 블록' 앵커는 이웃 릴 배지를 잡았다. 감사 241쪽에서 배지 15개 중
+    #   12개가 ytInitialData 앞(이웃), 구 규칙 양성 9건 중 6건이 이웃 배지였다. 링크카드와 같이
+    #   ytInitialData 구간 안의 배지만 이 영상 것으로 인정하고, 구간을 못 찾으면 NULL(측정 실패).
+    #   ai_disclosure_raw는 페이지 전체 배지 수(진단용)로 유지한다.
     badges = list(AI_BADGE.finditer(t))
-    car_starts = [m.start() for m in CAROUSEL_BLOCK.finditer(t)]
     ai_raw_hits = len(badges)
-    ai_text = badges[-1].group(1) if badges else None
-    synthetic_disclosure = 0
-    if badges and car_starts:
-        last_car = car_starts[-1]
-        if any(last_car <= m.start() < last_car + AI_ANCHOR_WINDOW for m in badges):
-            synthetic_disclosure = 1
+    own = [m for m in badges if i0 >= 0 and m.start() >= i0]
+    ai_text = own[0].group(1) if own else None
+    synthetic_disclosure = (1 if own else 0) if i0 >= 0 else None
     # 구 마커가 되살아나면(YouTube 롤백) 침묵하지 않도록 흔적을 남긴다 — 앵커 측정에는 넣지 않음
     if not badges:
         legacy = AI_LEGACY.search(raw)
