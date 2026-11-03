@@ -473,10 +473,17 @@ def get_active_channels(conn) -> List[str]:
 
 def get_active_video_ids(conn, channel_id: str) -> List[str]:
     cutoff = (dt.datetime.utcnow() - dt.timedelta(days=config.ACTIVE_VIDEO_LOOKBACK_DAYS)).isoformat()
-    rows = conn.execute(
-        "SELECT video_id FROM videos WHERE channel_id=? AND published_at>=?",
-        (channel_id, cutoff)
-    ).fetchall()
+    if getattr(config, "TRACK_ALL_LONGFORM", False):
+        thr = getattr(config, "LONGFORM_DURATION_THRESHOLD", 180)
+        rows = conn.execute(
+            "SELECT video_id FROM videos WHERE channel_id=? AND (published_at>=? OR duration_s>?)",
+            (channel_id, cutoff, thr)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT video_id FROM videos WHERE channel_id=? AND published_at>=?",
+            (channel_id, cutoff)
+        ).fetchall()
     return [r[0] for r in rows]
 
 

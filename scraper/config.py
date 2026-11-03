@@ -36,6 +36,10 @@ ACTIVE_CHANNELS_ONLY_INTERSECTION = True
 # 영상 stats를 매일 업데이트할 윈도우 (game-day 기준)
 # 너무 오래된 영상은 변화 거의 없으므로 quota 절약
 ACTIVE_VIDEO_LOOKBACK_DAYS = 365      # 게시일 < N일 전 영상만 매일 갱신
+# 롱폼(>LONGFORM_DURATION_THRESHOLD)은 나이와 무관하게 매일 갱신 (2026-11-03)
+# 롱폼 링크 대상의 72%가 게시 1년 초과라 일별 조회가 없었음. 링크 도착 전 기간과 같은 채널 비교군 확보용.
+# 약 +11만 영상, +2,300 units/일 (합계 약 5,600)
+TRACK_ALL_LONGFORM = True
 
 # 임베드 재파싱은 더 좁게 — Shorts만, 최근 90일
 EMBED_REPARSE_LOOKBACK_DAYS = 180
