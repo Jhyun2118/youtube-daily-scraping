@@ -1,0 +1,44 @@
+name: Link Timing Tracker
+
+# 2026-11-03: 맥에서 돌던 링크카드 부착 시점 추적기(track_link_timing.py)를 출장 동안 클라우드로 옮김.
+# 2시간마다 B2의 link_timing_tracker.db를 받아 100분 이어 돌리고 다시 올린다.
+# 추적이 끝나면(meta done) 스크립트가 바로 끝난다. 11/12 이후 이 workflow는 비활성화할 것.
+on:
+  schedule:
+    - cron: '10 */2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: link-timing-tracker
+  cancel-in-progress: false
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    timeout-minutes: 115
+    env:
+      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
+      YOUTUBE_DB_DIR: /home/runner/youtube_daily_db
+      TRACKER_DB: /home/runner/youtube_daily_db/link_timing_tracker.db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: pip install -r scraper/requirements.txt
+      - name: Download tracker DB
+        run: |
+          mkdir -p "$YOUTUBE_DB_DIR"
+          python3 scraper/b2_sync.py get link_timing_tracker.db "$TRACKER_DB"
+      - name: Run tracker
+        run: |
+          cd scraper
+          python3 track_link_timing_cloud.py --max-minutes 100
+        continue-on-error: true
+      - name: Upload tracker DB
+        if: always()
+        run: |
+          test -f "$TRACKER_DB" && python3 scraper/b2_sync.py put link_timing_tracker.db "$TRACKER_DB"

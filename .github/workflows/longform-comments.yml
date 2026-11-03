@@ -1,0 +1,45 @@
+name: Longform Comments
+
+# 2026-11-03: 롱폼 링크 댓글 작성자 수집(탐색, scraper/longform_comments.py). 하루 1회, 상한 3,000 units.
+# 같은 API 쿼터를 일별 수집(약 5,800)과 나눠 쓴다. 합계 약 8,800 < 9,500.
+# 대기열을 다 받으면 남은 0으로 바로 끝난다. 끝난 뒤 이 workflow는 비활성화할 것.
+on:
+  schedule:
+    - cron: '30 14 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: longform-comments
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+      B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
+      B2_BUCKET: ${{ secrets.B2_BUCKET_NAME }}
+      YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+      YOUTUBE_DB_DIR: /home/runner/youtube_daily_db
+      COMMENTS_DB: /home/runner/youtube_daily_db/longform_comments_1103.sqlite
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: pip install -r scraper/requirements.txt
+      - name: Download comments DB (first run starts empty)
+        run: |
+          mkdir -p "$YOUTUBE_DB_DIR"
+          python3 scraper/b2_sync.py get longform_comments_1103.sqlite "$COMMENTS_DB" || [ $? -eq 3 ]
+      - name: Collect
+        run: |
+          cd scraper
+          python3 longform_comments.py --cap 3000
+        continue-on-error: true
+      - name: Upload comments DB
+        if: always()
+        run: |
+          test -f "$COMMENTS_DB" && python3 scraper/b2_sync.py put longform_comments_1103.sqlite "$COMMENTS_DB"

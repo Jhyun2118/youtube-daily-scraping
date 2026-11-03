@@ -473,17 +473,24 @@ def get_active_channels(conn) -> List[str]:
 
 def get_active_video_ids(conn, channel_id: str) -> List[str]:
     cutoff = (dt.datetime.utcnow() - dt.timedelta(days=config.ACTIVE_VIDEO_LOOKBACK_DAYS)).isoformat()
-    if getattr(config, "TRACK_ALL_LONGFORM", False):
-        thr = getattr(config, "LONGFORM_DURATION_THRESHOLD", 180)
-        rows = conn.execute(
-            "SELECT video_id FROM videos WHERE channel_id=? AND (published_at>=? OR duration_s>?)",
-            (channel_id, cutoff, thr)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT video_id FROM videos WHERE channel_id=? AND published_at>=?",
-            (channel_id, cutoff)
-        ).fetchall()
+    rows = conn.execute(
+        "SELECT video_id FROM videos WHERE channel_id=? AND published_at>=?",
+        (channel_id, cutoff)
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
+def get_old_longform_ids(conn, channel_id: str) -> List[str]:
+    """TRACK_ALL_LONGFORM: 게시 lookback 밖의 롱폼. stage 2에서 맨 뒤에 갱신해, 쿼터가 모자라면
+    이것부터 잘리고 기존 패널(get_active_video_ids)은 지켜진다 (Actions와 쿼터를 나눠 쓰므로)."""
+    if not getattr(config, "TRACK_ALL_LONGFORM", False):
+        return []
+    cutoff = (dt.datetime.utcnow() - dt.timedelta(days=config.ACTIVE_VIDEO_LOOKBACK_DAYS)).isoformat()
+    thr = getattr(config, "LONGFORM_DURATION_THRESHOLD", 180)
+    rows = conn.execute(
+        "SELECT video_id FROM videos WHERE channel_id=? AND published_at<? AND duration_s>?",
+        (channel_id, cutoff, thr)
+    ).fetchall()
     return [r[0] for r in rows]
 
 
@@ -864,7 +871,10 @@ def run(limit=None, dry_run=False, skip_embeds=False):
         all_video_ids = []
         for cid in active:
             all_video_ids.extend(get_active_video_ids(conn, cid))
-        log.info(f"  active videos to update: {len(all_video_ids):,}")
+        n_base = len(all_video_ids)
+        for cid in active:
+            all_video_ids.extend(get_old_longform_ids(conn, cid))
+        log.info(f"  active videos to update: {len(all_video_ids):,} (panel {n_base:,} first, then old longform {len(all_video_ids) - n_base:,})")
 
         if not dry_run:
             for v_chunk in batched(all_video_ids, config.BATCH_VIDEOS):
