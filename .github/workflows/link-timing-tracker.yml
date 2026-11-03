@@ -32,9 +32,11 @@ jobs:
       - name: Download tracker DB
         run: |
           mkdir -p "$YOUTUBE_DB_DIR"
-          python3 scraper/b2_sync.py get link_timing_tracker.db "$TRACKER_DB"
+          # B2에 아직 DB가 없으면(맥에서 올리기 전) 이번 실행은 건너뛴다
+          python3 scraper/b2_sync.py get link_timing_tracker.db "$TRACKER_DB" || { [ $? -eq 3 ] && echo "tracker DB not on B2 yet, skipping"; }
       - name: Run tracker
         run: |
+          test -f "$TRACKER_DB" || exit 0
           cd scraper
           python3 track_link_timing_cloud.py --max-minutes 100
         continue-on-error: true
