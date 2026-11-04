@@ -16,6 +16,9 @@ jobs:
   track:
     runs-on: ubuntu-latest
     timeout-minutes: 115
+    permissions:
+      actions: write
+      contents: read
     env:
       B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
       B2_APPLICATION_KEY: ${{ secrets.B2_APPLICATION_KEY }}
@@ -44,3 +47,13 @@ jobs:
         if: always()
         run: |
           test -f "$TRACKER_DB" && python3 scraper/b2_sync.py put link_timing_tracker.db "$TRACKER_DB"
+      # 새 workflow의 schedule이 몇 시간씩 안 뜨는 일이 있어(11/03 실측) 끝나면 다음 실행을 직접 건다.
+      # 추적이 끝나면(meta done) 걸지 않는다. concurrency로 동시에 하나만 돈다.
+      - name: Chain next run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test -f "$TRACKER_DB" || exit 0
+          done=$(python3 -c "import sqlite3,os; c=sqlite3.connect(os.environ['TRACKER_DB']); print(1 if c.execute(\"SELECT 1 FROM meta WHERE k='done'\").fetchone() else 0)")
+          if [ "$done" = "0" ]; then gh workflow run link-timing-tracker.yml --repo "${{ github.repository }}"; echo "next run dispatched"; else echo "tracker done, not chaining"; fi
