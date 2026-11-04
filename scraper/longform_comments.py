@@ -21,6 +21,8 @@ import time
 import sqlite3
 import argparse
 import requests
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import config  # noqa: E402
@@ -32,7 +34,7 @@ MAX_PAGES = 80
 URL = "https://www.googleapis.com/youtube/v3/commentThreads"
 
 
-def main(cap):
+def main(cap, force=False):
     key = config.get_api_key()
     q = list(csv.DictReader(open(QUEUE, encoding="utf-8")))
     q.sort(key=lambda r: int(r["priority"]))
@@ -41,6 +43,18 @@ def main(cap):
                   pages INTEGER, total_reported INTEGER, fetched_at TEXT)""")
     db.execute("""CREATE TABLE IF NOT EXISTS comments (video_id TEXT, comment_id TEXT PRIMARY KEY, author_ch_id TEXT,
                   published_at TEXT, like_count INTEGER)""")
+    # 쿼터일(태평양 자정 리셋)마다 한 번, 일별 수집이 끝났을 시간대(06~14시 PT)에만 돈다.
+    # 추적기 workflow가 실행마다 이 workflow를 걸어 주므로 여러 번 불려도 하루 상한을 넘지 않게 막는다.
+    pt = ZoneInfo("America/Los_Angeles")
+    now_pt = datetime.now(pt)
+    if not force:
+        if not 6 <= now_pt.hour < 14:
+            print(f"outside 06-14 PT window ({now_pt:%H:%M} PT), skip", flush=True)
+            return
+        last = db.execute("SELECT MAX(fetched_at) FROM fetch").fetchone()[0]
+        if last and datetime.fromisoformat(last).replace(tzinfo=timezone.utc).astimezone(pt).date() == now_pt.date():
+            print(f"already ran this quota day ({now_pt:%Y-%m-%d} PT), skip", flush=True)
+            return
     done = {r[0] for r in db.execute("SELECT video_id FROM fetch")}
     todo = [r for r in q if r["video_id"] not in done]
     print(f"queue {len(q):,} | done {len(done):,} | todo {len(todo):,} | cap {cap:,}", flush=True)
@@ -110,4 +124,6 @@ def main(cap):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--cap", type=int, default=3000)
-    main(ap.parse_args().cap)
+    ap.add_argument("--force", action="store_true", help="시간대와 하루 1회 제한 무시")
+    a = ap.parse_args()
+    main(a.cap, a.force)

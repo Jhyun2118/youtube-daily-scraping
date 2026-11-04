@@ -57,3 +57,6 @@ jobs:
           test -f "$TRACKER_DB" || exit 0
           done=$(python3 -c "import sqlite3,os; c=sqlite3.connect(os.environ['TRACKER_DB']); print(1 if c.execute(\"SELECT 1 FROM meta WHERE k='done'\").fetchone() else 0)")
           if [ "$done" = "0" ]; then gh workflow run link-timing-tracker.yml --repo "${{ github.repository }}"; echo "next run dispatched"; else echo "tracker done, not chaining"; fi
+          # 댓글 수집 workflow도 함께 깨운다. schedule이 안 떠도 돌게 하려는 것이고,
+          # longform_comments.py가 06~14시 PT와 쿼터일 1회를 스스로 지킨다.
+          gh workflow run longform-comments.yml --repo "${{ github.repository }}" || true
